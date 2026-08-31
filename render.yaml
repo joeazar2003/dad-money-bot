@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: dad-money-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn bot:app
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: ALLOWED_CHAT_ID
+        sync: false
