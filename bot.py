@@ -217,7 +217,7 @@ def handle_incoming_document(chat_id, document):
     file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
     resp = requests.get(file_url)
 
-    tmp_path = XLSX_PATH + ".tmp"
+    tmp_path = "incoming_tmp.xlsx"
     with open(tmp_path, "wb") as f:
         f.write(resp.content)
 
@@ -225,9 +225,9 @@ def handle_incoming_document(chat_id, document):
         wb = load_workbook(tmp_path)
         if "Log" not in wb.sheetnames:
             raise ValueError("Missing Log sheet")
-    except Exception as e:
+    except Exception:
         os.remove(tmp_path)
-        send_message(chat_id, f"Couldn't read that file: {type(e).__name__}: {e}")
+        send_message(chat_id, "I couldn't read that file properly (it needs a 'Log' sheet), so I kept your old data.")
         return
 
     os.replace(tmp_path, XLSX_PATH)
