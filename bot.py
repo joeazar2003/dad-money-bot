@@ -225,9 +225,9 @@ def handle_incoming_document(chat_id, document):
         wb = load_workbook(tmp_path)
         if "Log" not in wb.sheetnames:
             raise ValueError("Missing Log sheet")
-    except Exception:
+    except Exception as e:
         os.remove(tmp_path)
-        send_message(chat_id, "I couldn't read that file properly (it needs a 'Log' sheet), so I kept your old data.")
+        send_message(chat_id, f"Couldn't read that file: {type(e).__name__}: {e}")
         return
 
     os.replace(tmp_path, XLSX_PATH)
