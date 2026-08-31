@@ -25,13 +25,14 @@ XLSX_PATH = "dad_money.xlsx"
 
 HELP_TEXT = (
     "Hey! Just text me an amount whenever your dad sends you money, e.g.:\n\n"
-    "  50\n"
-    "  120.50 birthday gift\n"
-    "  $75 rent help\n\n"
+    "  5000 from Bassam Hanna\n"
+    "  five thousand dollars from Serge\n\n"
     "Commands:\n"
     "/total - see your running total\n"
     "/download - get the Excel file\n"
-    "/undo - remove the last entry\n"
+    "/undo - remove the last entry\n\n"
+    "Edited the Excel file yourself? Just send it back to me as a file "
+    "attachment and I'll use your edited version going forward.\n"
 )
 
 AMOUNT_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
@@ -200,18 +201,59 @@ def send_document(chat_id):
         )
 
 
+def handle_incoming_document(chat_id, document):
+    file_name = document.get("file_name", "")
+    if not file_name.lower().endswith(".xlsx"):
+        send_message(chat_id, "That doesn't look like an .xlsx file, so I left your data untouched.")
+        return
+
+    file_id = document.get("file_id")
+    info = requests.get(f"{API_URL}/getFile", params={"file_id": file_id}).json()
+    if not info.get("ok"):
+        send_message(chat_id, "Couldn't fetch that file from Telegram, try sending it again.")
+        return
+
+    file_path = info["result"]["file_path"]
+    file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+    resp = requests.get(file_url)
+
+    tmp_path = XLSX_PATH + ".tmp"
+    with open(tmp_path, "wb") as f:
+        f.write(resp.content)
+
+    try:
+        wb = load_workbook(tmp_path)
+        if "Log" not in wb.sheetnames:
+            raise ValueError("Missing Log sheet")
+    except Exception:
+        os.remove(tmp_path)
+        send_message(chat_id, "I couldn't read that file properly (it needs a 'Log' sheet), so I kept your old data.")
+        return
+
+    os.replace(tmp_path, XLSX_PATH)
+    total, count = get_total()
+    send_message(chat_id, f"Got it — saved your edits. Running total is now ${total:,.2f} ({count} entries). New entries will build on top of this.")
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     update = request.get_json(force=True, silent=True) or {}
     message = update.get("message", {})
     chat_id = message.get("chat", {}).get("id")
-    text = (message.get("text") or "").strip()
 
-    if chat_id is None or not text:
+    if chat_id is None:
         return "ok"
 
     if chat_id != ALLOWED_CHAT_ID:
         # Ignore anyone who isn't you.
+        return "ok"
+
+    if "document" in message:
+        handle_incoming_document(chat_id, message["document"])
+        return "ok"
+
+    text = (message.get("text") or "").strip()
+    if not text:
         return "ok"
 
     if text in ("/start", "/help"):
