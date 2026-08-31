@@ -1,11 +1,18 @@
 import os
 import re
 import io
+from collections import defaultdict
 from datetime import datetime
 
 import requests
 from flask import Flask, request
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font
+
+MONTH_NAMES = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
 
 app = Flask(__name__)
 
@@ -29,6 +36,75 @@ HELP_TEXT = (
 
 AMOUNT_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
 
+NUMBER_WORDS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
+    "eighteen": 18, "nineteen": 19, "twenty": 20, "thirty": 30, "forty": 40,
+    "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+}
+SCALE_WORDS = {"hundred": 100, "thousand": 1000, "million": 1000000, "billion": 1000000000}
+FILLER_AFTER_AMOUNT = {"dollars", "dollar", "usd", "bucks"}
+
+
+def words_to_number(words):
+    total = 0
+    current = 0
+    for w in words:
+        if w in NUMBER_WORDS:
+            current += NUMBER_WORDS[w]
+        elif w in SCALE_WORDS:
+            scale = SCALE_WORDS[w]
+            current = (current or 1) * scale
+            if scale >= 1000:
+                total += current
+                current = 0
+    return total + current
+
+
+def clean_word(w):
+    return re.sub(r"[^a-zA-Z]", "", w).lower()
+
+
+def extract_amount_and_note(text):
+    # 1) Prefer plain digits, e.g. "5000 from Bassam Hanna"
+    match = AMOUNT_RE.search(text)
+    if match:
+        amount = float(match.group())
+        note = (text[:match.start()] + text[match.end():]).strip(" $-")
+        return amount, note
+
+    # 2) Fall back to spelled-out numbers, e.g. "five thousand dollars from Bassam Hanna"
+    words = text.split()
+    n = len(words)
+    best_start = best_end = None
+    i = 0
+    while i < n:
+        if clean_word(words[i]) in NUMBER_WORDS or clean_word(words[i]) in SCALE_WORDS:
+            start = i
+            j = i
+            while j < n and (clean_word(words[j]) in NUMBER_WORDS or clean_word(words[j]) in SCALE_WORDS):
+                j += 1
+            if best_start is None or (j - start) > (best_end - best_start):
+                best_start, best_end = start, j
+            i = j
+        else:
+            i += 1
+
+    if best_start is None:
+        return None, text
+
+    number_words = [clean_word(w) for w in words[best_start:best_end]]
+    amount = words_to_number(number_words)
+    if amount <= 0:
+        return None, text
+
+    remaining = words[:best_start] + words[best_end:]
+    if remaining and clean_word(remaining[0]) in FILLER_AFTER_AMOUNT:
+        remaining = remaining[1:]
+    note = " ".join(remaining).strip(" $-")
+    return amount, note
+
 
 def ensure_workbook():
     if not os.path.exists(XLSX_PATH):
@@ -39,11 +115,48 @@ def ensure_workbook():
         wb.save(XLSX_PATH)
 
 
+def rebuild_summary(wb):
+    log_ws = wb["Log"]
+    monthly = defaultdict(lambda: defaultdict(float))
+
+    for row in log_ws.iter_rows(min_row=2, values_only=True):
+        date_str, amount = row[0], row[1]
+        if not date_str or amount is None:
+            continue
+        try:
+            dt = datetime.strptime(str(date_str), "%Y-%m-%d %H:%M")
+        except ValueError:
+            continue
+        monthly[dt.year][dt.month] += float(amount)
+
+    if "Summary" in wb.sheetnames:
+        del wb["Summary"]
+    ws = wb.create_sheet("Summary")
+    ws.append(["Year", "Month", "Total"])
+    ws["A1"].font = ws["B1"].font = ws["C1"].font = Font(bold=True)
+
+    for year in sorted(monthly.keys()):
+        year_total = 0.0
+        for month in sorted(monthly[year].keys()):
+            total = monthly[year][month]
+            year_total += total
+            ws.append([year, MONTH_NAMES[month - 1], round(total, 2)])
+        total_row = ws.max_row + 1
+        ws.append([year, "Year Total", round(year_total, 2)])
+        for col in ("A", "B", "C"):
+            ws[f"{col}{total_row}"].font = Font(bold=True)
+        ws.append([])
+
+    for col, width in zip("ABC", (8, 14, 14)):
+        ws.column_dimensions[col].width = width
+
+
 def append_entry(amount, note):
     ensure_workbook()
     wb = load_workbook(XLSX_PATH)
     ws = wb["Log"]
     ws.append([datetime.now().strftime("%Y-%m-%d %H:%M"), amount, note])
+    rebuild_summary(wb)
     wb.save(XLSX_PATH)
 
 
@@ -55,6 +168,7 @@ def undo_last():
         return None
     last_row = [c.value for c in ws[ws.max_row]]
     ws.delete_rows(ws.max_row)
+    rebuild_summary(wb)
     wb.save(XLSX_PATH)
     return last_row
 
@@ -121,13 +235,11 @@ def webhook():
             send_message(chat_id, "Nothing to undo.")
         return "ok"
 
-    match = AMOUNT_RE.search(text)
-    if not match:
-        send_message(chat_id, "Didn't catch an amount there. Try something like: 50 or $75 groceries")
+    amount, note = extract_amount_and_note(text)
+    if amount is None:
+        send_message(chat_id, "Didn't catch an amount there. Try something like: 5000 from Bassam Hanna or five thousand dollars from Serge")
         return "ok"
 
-    amount = float(match.group())
-    note = (text[:match.start()] + text[match.end():]).strip(" $-")
     append_entry(amount, note)
     total, count = get_total()
     send_message(chat_id, f"Logged ${amount:,.2f}. Running total: ${total:,.2f} ({count} entries).")
