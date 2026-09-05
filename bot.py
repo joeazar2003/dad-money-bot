@@ -1,11 +1,12 @@
 import os
+import hmac
 import re
 import io
 from collections import defaultdict
 from datetime import datetime
 
 import requests
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
 
@@ -23,6 +24,7 @@ ALLOWED_CHAT_ID = int(os.environ["ALLOWED_CHAT_ID"])
 API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 XLSX_PATH = "dad_money.xlsx"
 HOME_CURRENCY = os.environ.get("HOME_CURRENCY", "CAD").upper()
+PAP_API_KEY = os.environ.get("PAP_API_KEY")
 
 # Recognized ways someone might mention a currency, mapped to its code.
 # Longer phrases are checked before shorter ones so "us dollars" matches
@@ -526,6 +528,14 @@ def webhook():
     send_message(chat_id, f"Logged ${amount:,.2f} CAD. Running total: ${total:,.2f} CAD ({count} entries).")
     return "ok"
 
+
+@app.route("/api/total", methods=["GET"])
+def api_total():
+    key = request.args.get("key", "")
+    if not PAP_API_KEY or not hmac.compare_digest(key, PAP_API_KEY):
+        return jsonify({"error": "unauthorized"}), 401
+    total, count = get_total()
+    return jsonify({"total": total, "count": count, "currency": HOME_CURRENCY})
 
 @app.route("/", methods=["GET"])
 def health():
