@@ -40,17 +40,22 @@ _drive_service = None
 _drive_file_id = None
 
 # --- Finance tracker Google Sheet ---
-# Separate step-by-step flow (/log) that walks through the notebook's
-# categories and appends a row to the "Joe Finance Tracker" Sheet, pulling
-# the PAP (dad's money) figure straight from get_total() above.
+# Step-by-step flow (/log) that appends a row to the "Joe Finance Tracker"
+# Sheet, pulling the PAP (dad's money) figure straight from get_total()
+# above. Layout: Safe and Drawer are always asked; the people who owe you
+# or are owed money change every time, so those are collected as one
+# free-form "anyone else" answer (amount + name pairs) rather than fixed
+# columns; then the three bank balances, in order.
 FINANCE_SPREADSHEET_ID = os.environ.get(
     "FINANCE_SPREADSHEET_ID", "15RlB-83RQvTVECBmmcXsPYDTirGhIbzmwe3yVkYUHlA"
 )
 FINANCE_SHEET_NAME = os.environ.get("FINANCE_SHEET_NAME", "Sheet1")
-FINANCE_CATEGORY_COLUMNS = [
-    "Safe", "Bassel", "Celine", "OJ", "Chiki", "George", "Gifts",
-    "Other Cash", "RBC", "TD", "Scotiabank", "Amex/Platinum", "Other Bank/Debt",
-]
+FINANCE_BANK_ORDER = ["TD", "RBC", "Scotiabank"]
+FINANCE_BANK_LINKS = {
+    "TD": "https://easyweb.td.com/waw/idp/login.htm",
+    "RBC": "https://www1.royalbank.com/sgw3/secureauth/login",
+    "Scotiabank": "https://www1.scotiaonline.scotiabank.com/online/authentication/authentication.bns",
+}
 _sheets_service = None
 finance_sessions = {}
 
@@ -146,9 +151,66 @@ def get_sheets_service():
     return _sheets_service
 
 
-def append_finance_row(date_str, values, pap):
+def parse_finance_amount(text):
+    """Returns a float, or None if it couldn't be parsed. 'skip'/'0'/etc mean 0."""
+    low = text.strip().lower()
+    if low in ("skip", "0", "-", "none", "n/a", ""):
+        return 0.0
+    cleaned = text.strip().replace(",", "").replace("$", "")
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+NUMBER_TOKEN_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?$")
+
+
+def parse_others(text):
+    """Parses a free-form list like '299 george -100 bassel - 144 jose 350 jaber'
+    into [(amount, name), ...]. Positive = owed to you, negative = you owe them."""
+    normalized = re.sub(r"-\s+(\d)", r"-\1", text.replace(",", " "))
+    tokens = normalized.split()
+    items = []
+    i, n = 0, len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if NUMBER_TOKEN_RE.match(tok):
+            amount = float(tok)
+            i += 1
+            name_parts = []
+            while i < n and not NUMBER_TOKEN_RE.match(tokens[i]):
+                name_parts.append(tokens[i])
+                i += 1
+            name = " ".join(name_parts).strip(" ,") or "Unknown"
+            items.append((amount, name))
+        else:
+            i += 1
+    return items
+
+
+def format_others_detail(items):
+    if not items:
+        return "(none)"
+    parts = []
+    for amt, name in items:
+        sign = "+" if amt >= 0 else "-"
+        val = abs(amt)
+        val_str = f"{val:.0f}" if val == int(val) else f"{val:.2f}"
+        parts.append(f"{sign}{val_str} {name}")
+    return ", ".join(parts)
+
+
+def bank_keyboard(bank):
+    url = FINANCE_BANK_LINKS.get(bank)
+    if not url:
+        return None
+    return {"inline_keyboard": [[{"text": f"Open {bank}", "url": url}]]}
+
+
+def append_finance_row(date_str, values, others_detail, pap):
     """Write one row to the finance tracker Sheet. Leaves the Cash+Bank
-    Subtotal (O) and Net Total (Q) columns untouched so the Sheet's own
+    Subtotal (I) and Net Total (K) columns untouched so the Sheet's own
     ARRAYFORMULA in those columns keeps computing them."""
     service = get_sheets_service()
     col_a = service.spreadsheets().values().get(
@@ -157,12 +219,21 @@ def append_finance_row(date_str, values, pap):
     ).execute().get("values", [])
     next_row = max(len(col_a) + 1, 2)
 
-    row_values = [date_str] + [values.get(cat, 0) for cat in FINANCE_CATEGORY_COLUMNS]
+    row_values = [
+        date_str,
+        values["Safe"],
+        values["Drawer"],
+        others_detail,
+        values["Others"],
+        values["TD"],
+        values["RBC"],
+        values["Scotiabank"],
+    ]
     body = {
         "valueInputOption": "USER_ENTERED",
         "data": [
-            {"range": f"{FINANCE_SHEET_NAME}!A{next_row}:N{next_row}", "values": [row_values]},
-            {"range": f"{FINANCE_SHEET_NAME}!P{next_row}", "values": [[pap]]},
+            {"range": f"{FINANCE_SHEET_NAME}!A{next_row}:H{next_row}", "values": [row_values]},
+            {"range": f"{FINANCE_SHEET_NAME}!J{next_row}", "values": [[pap]]},
         ],
     }
     service.spreadsheets().values().batchUpdate(
@@ -171,16 +242,9 @@ def append_finance_row(date_str, values, pap):
     return next_row
 
 
-def finance_prompt_for_step(step):
-    if step == 0:
-        return "New finance entry. Date? (YYYY-MM-DD, or 'today'. /cancel to stop)"
-    cat = FINANCE_CATEGORY_COLUMNS[step - 1]
-    return f"{cat}? (amount, or 0 to skip)"
-
-
 def start_finance_session(chat_id):
-    finance_sessions[chat_id] = {"step": 0, "values": {}, "date": None}
-    send_message(chat_id, finance_prompt_for_step(0))
+    finance_sessions[chat_id] = {"step": "date", "values": {}}
+    send_message(chat_id, "New finance entry. Date? (YYYY-MM-DD, or 'today'. /cancel to stop)")
 
 
 def handle_finance_session(chat_id, text):
@@ -192,10 +256,14 @@ def handle_finance_session(chat_id, text):
         send_message(chat_id, "Cancelled, nothing saved.")
         return
 
-    if session["step"] == "confirm":
+    step = session["step"]
+
+    if step == "confirm":
         if stripped.lower() in ("yes", "y"):
             try:
-                row = append_finance_row(session["date"], session["values"], session["pap"])
+                row = append_finance_row(
+                    session["date"], session["values"], session["others_detail"], session["pap"]
+                )
             except Exception as e:
                 print("Finance sheet write failed:", e)
                 send_message(chat_id, f"Couldn't save to the Sheet ({e}). Try /log again in a bit.")
@@ -209,9 +277,7 @@ def handle_finance_session(chat_id, text):
             send_message(chat_id, "Reply yes or no.")
         return
 
-    step = session["step"]
-
-    if step == 0:
+    if step == "date":
         low = stripped.lower()
         if low == "today":
             date_val = datetime.now().strftime("%Y-%m-%d")
@@ -221,48 +287,87 @@ def handle_finance_session(chat_id, text):
             send_message(chat_id, "Didn't catch that date. Use YYYY-MM-DD or 'today'.")
             return
         session["date"] = date_val
-        session["step"] = 1
-        send_message(chat_id, finance_prompt_for_step(1))
+        session["step"] = "safe"
+        send_message(chat_id, "Safe? (amount, or 0 to skip)")
         return
 
-    cat = FINANCE_CATEGORY_COLUMNS[step - 1]
-    low = stripped.lower()
-    if low in ("skip", "0", "-", "none", "n/a"):
-        amount = 0.0
-    else:
-        cleaned = stripped.replace(",", "").replace("$", "")
-        try:
-            amount = float(cleaned)
-        except ValueError:
-            send_message(chat_id, f"Didn't catch a number for {cat}. Enter an amount, or 0 to skip.")
+    if step == "safe":
+        amount = parse_finance_amount(stripped)
+        if amount is None:
+            send_message(chat_id, "Didn't catch a number for Safe. Enter an amount, or 0 to skip.")
             return
-    session["values"][cat] = amount
-
-    next_step = step + 1
-    if next_step <= len(FINANCE_CATEGORY_COLUMNS):
-        session["step"] = next_step
-        send_message(chat_id, finance_prompt_for_step(next_step))
+        session["values"]["Safe"] = amount
+        session["step"] = "drawer"
+        send_message(chat_id, "Drawer? (amount, or 0 to skip)")
         return
 
-    pap, _ = get_total()
-    subtotal = sum(session["values"].values())
-    net = subtotal - pap
-    session["pap"] = pap
-    session["step"] = "confirm"
-    lines = [
-        f"{c}: ${session['values'][c]:,.2f}"
-        for c in FINANCE_CATEGORY_COLUMNS
-        if session["values"][c]
-    ]
-    summary = (
-        f"Date: {session['date']}\n"
-        + ("\n".join(lines) if lines else "(all zero)")
-        + f"\n\nCash+Bank subtotal: ${subtotal:,.2f}"
-        + f"\nPAP (dad's money): ${pap:,.2f}"
-        + f"\nNet total: ${net:,.2f}"
-        + "\n\nSave this to the sheet? yes/no"
-    )
-    send_message(chat_id, summary)
+    if step == "drawer":
+        amount = parse_finance_amount(stripped)
+        if amount is None:
+            send_message(chat_id, "Didn't catch a number for Drawer. Enter an amount, or 0 to skip.")
+            return
+        session["values"]["Drawer"] = amount
+        session["step"] = "others"
+        send_message(
+            chat_id,
+            "Anyone else? List amount + name pairs in one message, e.g.\n"
+            "299 george -100 bassel -144 jose 350 jaber\n"
+            "(positive = they owe you, negative = you owe them). Or reply no/done.",
+        )
+        return
+
+    if step == "others":
+        if stripped.lower() in ("no", "none", "done", "skip", "-"):
+            items = []
+        else:
+            items = parse_others(stripped)
+        session["values"]["Others"] = sum(amt for amt, _ in items)
+        session["others_detail"] = format_others_detail(items)
+        session["step"] = FINANCE_BANK_ORDER[0]
+        first_bank = FINANCE_BANK_ORDER[0]
+        send_message(
+            chat_id, f"{first_bank}? (amount, or 0 to skip)", reply_markup=bank_keyboard(first_bank)
+        )
+        return
+
+    if step in FINANCE_BANK_ORDER:
+        amount = parse_finance_amount(stripped)
+        if amount is None:
+            send_message(chat_id, f"Didn't catch a number for {step}. Enter an amount, or 0 to skip.")
+            return
+        session["values"][step] = amount
+        idx = FINANCE_BANK_ORDER.index(step)
+        if idx + 1 < len(FINANCE_BANK_ORDER):
+            next_bank = FINANCE_BANK_ORDER[idx + 1]
+            session["step"] = next_bank
+            send_message(
+                chat_id, f"{next_bank}? (amount, or 0 to skip)", reply_markup=bank_keyboard(next_bank)
+            )
+            return
+
+        pap, _ = get_total()
+        subtotal = (
+            session["values"]["Safe"]
+            + session["values"]["Drawer"]
+            + session["values"]["Others"]
+            + sum(session["values"][b] for b in FINANCE_BANK_ORDER)
+        )
+        net = subtotal - pap
+        session["pap"] = pap
+        session["step"] = "confirm"
+        summary = (
+            f"Date: {session['date']}\n"
+            f"Safe: ${session['values']['Safe']:,.2f}\n"
+            f"Drawer: ${session['values']['Drawer']:,.2f}\n"
+            f"Others: {session['others_detail']} (net ${session['values']['Others']:,.2f})\n"
+            + "\n".join(f"{b}: ${session['values'][b]:,.2f}" for b in FINANCE_BANK_ORDER)
+            + f"\n\nCash+Bank subtotal: ${subtotal:,.2f}"
+            + f"\nPAP (dad's money): ${pap:,.2f}"
+            + f"\nNet total: ${net:,.2f}"
+            + "\n\nSave this to the sheet? yes/no"
+        )
+        send_message(chat_id, summary)
+        return
 
 
 # Recognized ways someone might mention a currency, mapped to its code.
@@ -622,8 +727,11 @@ def get_total():
     return total, count
 
 
-def send_message(chat_id, text):
-    requests.post(f"{API_URL}/sendMessage", json={"chat_id": chat_id, "text": text})
+def send_message(chat_id, text, reply_markup=None):
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    requests.post(f"{API_URL}/sendMessage", json=payload)
 
 
 def send_document(chat_id):
