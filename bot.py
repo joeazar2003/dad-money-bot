@@ -219,11 +219,19 @@ def append_finance_row(date_str, values, others_detail, pap):
     ).execute().get("values", [])
     next_row = max(len(col_a) + 1, 2)
 
+    # Force others_detail to be treated as plain text: with
+    # valueInputOption=USER_ENTERED, a string starting with "+" (or "=")
+    # is parsed by Sheets as a formula (e.g. "+299 george..." -> #ERROR!).
+    # A leading apostrophe forces literal text, matching manual entry.
+    safe_others_detail = (
+        "'" + others_detail if others_detail and others_detail[0] in "+=-" else others_detail
+    )
+
     row_values = [
         date_str,
         values["Safe"],
         values["Drawer"],
-        others_detail,
+        safe_others_detail,
         values["Others"],
         values["TD"],
         values["RBC"],
