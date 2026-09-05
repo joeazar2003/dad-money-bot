@@ -1080,11 +1080,12 @@ def strip_total_row(ws):
 
 
 def add_log_total_row(ws):
-    total = 0.0
-    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, values_only=True):
-        if row[1] is not None:
-            total += float(row[1])
-    ws.append(["TOTAL", round(total, 2), ""])
+    """Append a TOTAL row whose Amount cell is a live SUM() formula (not a
+    baked-in number), so editing any entry's amount directly in the Sheet
+    recalculates it automatically - same idea as the Layout Draft block's
+    Subtotal/Net formulas."""
+    last_data_row = ws.max_row
+    ws.append(["TOTAL", f"=SUM(B2:B{last_data_row})", ""])
     r = ws.max_row
     for col in range(1, 4):
         c = ws.cell(row=r, column=col)
