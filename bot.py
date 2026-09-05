@@ -996,12 +996,13 @@ def get_last_entry(ws):
 def is_recent_duplicate(amount, minutes=10):
     ensure_workbook()
     wb = load_workbook(XLSX_PATH)
-    ws = wb["Log"]
+    ws = get_log_ws(wb)
     last = get_last_entry(ws)
     if not last or last[1] is None:
         return False
+    timestamp = last[3] if len(last) > 3 and last[3] else last[0]
     try:
-        last_dt = datetime.strptime(str(last[0]), "%Y-%m-%d %H:%M")
+        last_dt = datetime.strptime(str(timestamp), "%Y-%m-%d %H:%M")
     except ValueError:
         return False
     same_amount = abs(float(last[1]) - float(amount)) < 0.01
@@ -1020,7 +1021,7 @@ def extract_sender(note):
 def get_sender_breakdown():
     ensure_workbook()
     wb = load_workbook(XLSX_PATH)
-    ws = wb["Log"]
+    ws = get_log_ws(wb)
     totals = defaultdict(float)
     for row in ws.iter_rows(min_row=2, values_only=True):
         if is_total_row(row):
@@ -1035,10 +1036,13 @@ def get_sender_breakdown():
 def get_month_total(year, month):
     ensure_workbook()
     wb = load_workbook(XLSX_PATH)
-    ws = wb["Log"]
+    ws = get_log_ws(wb)
     total, count = 0.0, 0
     for row in ws.iter_rows(min_row=2, values_only=True):
-        date_str, amount = row[0], row[1]
+        if is_total_row(row):
+            continue
+        amount = row[1]
+        date_str = row[3] if len(row) > 3 and row[3] else row[0]
         if not date_str or amount is None:
             continue
         try:
@@ -1095,9 +1099,60 @@ def finalize_log_sheet(ws):
         add_log_total_row(ws)
     style_header(ws)
     apply_borders(ws)
-    ws.column_dimensions["A"].width = 18
+    ws.column_dimensions["A"].width = 14
     ws.column_dimensions["B"].width = 12
     ws.column_dimensions["C"].width = 45
+    ws.column_dimensions["D"].hidden = True
+
+
+def migrate_log_dates(ws):
+    """One-time upgrade for rows written before there was a Timestamp column:
+    splits the old full "%Y-%m-%d %H:%M" Date value into a friendly display
+    ("September 5") in column A plus the original timestamp in column D, so
+    duplicate-detection and monthly totals keep working off real datetimes
+    while the sheet itself just shows a readable date. Returns True if any
+    row was migrated."""
+    changed = False
+    for r in range(2, ws.max_row + 1):
+        row = [c.value for c in ws[r]]
+        if is_total_row(row):
+            continue
+        date_val = row[0] if row else None
+        timestamp_val = row[3] if len(row) > 3 else None
+        if date_val is None or timestamp_val:
+            continue
+        try:
+            dt = datetime.strptime(str(date_val), "%Y-%m-%d %H:%M")
+        except ValueError:
+            continue
+        ws.cell(row=r, column=1).value = f"{MONTH_NAMES[dt.month - 1]} {dt.day}"
+        ws.cell(row=r, column=4).value = dt.strftime("%Y-%m-%d %H:%M")
+        changed = True
+    return changed
+
+
+def prepare_log_ws(ws):
+    """Ensure the Timestamp column exists and legacy rows are migrated.
+    Does not save - callers decide whether/how to persist. Returns True if
+    anything changed."""
+    changed = False
+    if ws["D1"].value != "Timestamp":
+        ws.cell(row=1, column=4).value = "Timestamp"
+        changed = True
+    if migrate_log_dates(ws):
+        changed = True
+    return changed
+
+
+def get_log_ws(wb):
+    """Common case: load Log, migrate legacy rows in place, and persist
+    immediately if anything changed - self-healing on first touch, whether
+    that touch is a read or a write."""
+    ws = wb["Log"]
+    if prepare_log_ws(ws):
+        wb.save(XLSX_PATH)
+        upload_to_drive()
+    return ws
 
 
 def ensure_workbook():
@@ -1107,11 +1162,12 @@ def ensure_workbook():
         wb = Workbook()
         ws = wb.active
         ws.title = "Log"
-        ws.append(["Date", "Amount", "Note"])
+        ws.append(["Date", "Amount", "Note", "Timestamp"])
         style_header(ws)
-        ws.column_dimensions["A"].width = 18
+        ws.column_dimensions["A"].width = 14
         ws.column_dimensions["B"].width = 12
         ws.column_dimensions["C"].width = 45
+        ws.column_dimensions["D"].hidden = True
         wb.save(XLSX_PATH)
         upload_to_drive()
 
@@ -1123,7 +1179,8 @@ def rebuild_summary(wb):
     for row in log_ws.iter_rows(min_row=2, values_only=True):
         if is_total_row(row):
             continue
-        date_str, amount = row[0], row[1]
+        amount = row[1]
+        date_str = row[3] if len(row) > 3 and row[3] else row[0]
         if not date_str or amount is None:
             continue
         try:
@@ -1159,9 +1216,12 @@ def rebuild_summary(wb):
 def append_entry(amount, note):
     ensure_workbook()
     wb = load_workbook(XLSX_PATH)
-    ws = wb["Log"]
+    ws = get_log_ws(wb)
     strip_total_row(ws)
-    ws.append([datetime.now().strftime("%Y-%m-%d %H:%M"), amount, note])
+    now = datetime.now()
+    date_display = f"{MONTH_NAMES[now.month - 1]} {now.day}"
+    timestamp = now.strftime("%Y-%m-%d %H:%M")
+    ws.append([date_display, amount, note, timestamp])
     finalize_log_sheet(ws)
     rebuild_summary(wb)
     wb.save(XLSX_PATH)
@@ -1171,7 +1231,7 @@ def append_entry(amount, note):
 def undo_last():
     ensure_workbook()
     wb = load_workbook(XLSX_PATH)
-    ws = wb["Log"]
+    ws = get_log_ws(wb)
     strip_total_row(ws)
     if ws.max_row <= 1:
         return None
@@ -1187,7 +1247,7 @@ def undo_last():
 def get_total():
     ensure_workbook()
     wb = load_workbook(XLSX_PATH)
-    ws = wb["Log"]
+    ws = get_log_ws(wb)
     total = 0.0
     count = 0
     for row in ws.iter_rows(min_row=2, values_only=True):
@@ -1246,6 +1306,7 @@ def handle_incoming_document(chat_id, document):
         return
 
     ws = wb["Log"]
+    prepare_log_ws(ws)
     finalize_log_sheet(ws)
     rebuild_summary(wb)
     wb.save(tmp_path)
