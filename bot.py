@@ -1,7 +1,7 @@
 import os
-import hmac
 import re
 import io
+import hmac
 from collections import defaultdict
 from datetime import datetime
 
@@ -9,6 +9,9 @@ import requests
 from flask import Flask, request, jsonify
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 MONTH_NAMES = [
     "January", "February", "March", "April", "May", "June",
@@ -25,6 +28,97 @@ API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 XLSX_PATH = "dad_money.xlsx"
 HOME_CURRENCY = os.environ.get("HOME_CURRENCY", "CAD").upper()
 PAP_API_KEY = os.environ.get("PAP_API_KEY")
+
+# --- Google Drive backup ---
+# Render's free plan wipes local disk on every restart/redeploy, so the
+# Excel file is mirrored to Google Drive after every change and restored
+# from there on startup if the local copy is missing.
+GOOGLE_CREDS_PATH = os.environ.get("GOOGLE_CREDS_PATH", "/etc/secrets/google-credentials.json")
+DRIVE_FILE_NAME = "dad_money.xlsx"
+DRIVE_SHARE_EMAIL = os.environ.get("DRIVE_SHARE_EMAIL", "joeazar2003@gmail.com")
+_drive_service = None
+_drive_file_id = None
+
+
+def get_drive_service():
+    global _drive_service
+    if _drive_service is None:
+        creds = service_account.Credentials.from_service_account_file(
+            GOOGLE_CREDS_PATH,
+            scopes=["https://www.googleapis.com/auth/drive"],
+        )
+        _drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    return _drive_service
+
+
+def find_drive_file_id():
+    global _drive_file_id
+    if _drive_file_id:
+        return _drive_file_id
+    try:
+        service = get_drive_service()
+        resp = service.files().list(
+            q=f"name='{DRIVE_FILE_NAME}' and trashed=false",
+            spaces="drive",
+            fields="files(id, name)",
+        ).execute()
+        files = resp.get("files", [])
+        if files:
+            _drive_file_id = files[0]["id"]
+    except Exception as e:
+        print("Drive lookup failed:", e)
+    return _drive_file_id
+
+
+def download_from_drive():
+    try:
+        file_id = find_drive_file_id()
+        if not file_id:
+            return False
+        service = get_drive_service()
+        req = service.files().get_media(fileId=file_id)
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, req)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        with open(XLSX_PATH, "wb") as f:
+            f.write(buf.getvalue())
+        return True
+    except Exception as e:
+        print("Drive download failed:", e)
+        return False
+
+
+def upload_to_drive():
+    global _drive_file_id
+    try:
+        service = get_drive_service()
+        file_id = find_drive_file_id()
+        media = MediaFileUpload(
+            XLSX_PATH,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            resumable=False,
+        )
+        if file_id:
+            service.files().update(fileId=file_id, media_body=media).execute()
+        else:
+            created = service.files().create(
+                body={"name": DRIVE_FILE_NAME}, media_body=media, fields="id"
+            ).execute()
+            _drive_file_id = created["id"]
+            if DRIVE_SHARE_EMAIL:
+                try:
+                    service.permissions().create(
+                        fileId=_drive_file_id,
+                        body={"type": "user", "role": "writer", "emailAddress": DRIVE_SHARE_EMAIL},
+                        sendNotificationEmail=False,
+                    ).execute()
+                except Exception as e:
+                    print("Drive share failed:", e)
+    except Exception as e:
+        print("Drive upload failed:", e)
+
 
 # Recognized ways someone might mention a currency, mapped to its code.
 # Longer phrases are checked before shorter ones so "us dollars" matches
@@ -285,6 +379,8 @@ def finalize_log_sheet(ws):
 
 def ensure_workbook():
     if not os.path.exists(XLSX_PATH):
+        if download_from_drive():
+            return
         wb = Workbook()
         ws = wb.active
         ws.title = "Log"
@@ -294,6 +390,7 @@ def ensure_workbook():
         ws.column_dimensions["B"].width = 12
         ws.column_dimensions["C"].width = 45
         wb.save(XLSX_PATH)
+        upload_to_drive()
 
 
 def rebuild_summary(wb):
@@ -345,6 +442,7 @@ def append_entry(amount, note):
     finalize_log_sheet(ws)
     rebuild_summary(wb)
     wb.save(XLSX_PATH)
+    upload_to_drive()
 
 
 def undo_last():
@@ -359,6 +457,7 @@ def undo_last():
     finalize_log_sheet(ws)
     rebuild_summary(wb)
     wb.save(XLSX_PATH)
+    upload_to_drive()
     return last_row
 
 
@@ -425,6 +524,7 @@ def handle_incoming_document(chat_id, document):
     rebuild_summary(wb)
     wb.save(tmp_path)
     os.replace(tmp_path, XLSX_PATH)
+    upload_to_drive()
     total, count = get_total()
     send_message(chat_id, f"Got it — saved your edits. Running total is now ${total:,.2f} ({count} entries). New entries will build on top of this.")
 
@@ -536,6 +636,7 @@ def api_total():
         return jsonify({"error": "unauthorized"}), 401
     total, count = get_total()
     return jsonify({"total": total, "count": count, "currency": HOME_CURRENCY})
+
 
 @app.route("/", methods=["GET"])
 def health():
