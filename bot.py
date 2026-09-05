@@ -50,12 +50,18 @@ FINANCE_SPREADSHEET_ID = os.environ.get(
     "FINANCE_SPREADSHEET_ID", "15RlB-83RQvTVECBmmcXsPYDTirGhIbzmwe3yVkYUHlA"
 )
 FINANCE_SHEET_NAME = os.environ.get("FINANCE_SHEET_NAME", "Sheet1")
+# The new per-entry "block" layout (auto date, TD Credit/Plat/Aero, colored
+# groups) is written to this tab. Kept separate from FINANCE_SHEET_NAME so
+# the old row-based Sheet1 data isn't touched until it's ready to migrate.
+FINANCE_BLOCK_SHEET_NAME = os.environ.get("FINANCE_BLOCK_SHEET_NAME", "Layout Draft")
 FINANCE_BANK_ORDER = ["TD", "RBC", "Scotiabank"]
 FINANCE_BANK_LINKS = {
     "TD": "https://easyweb.td.com/waw/idp/login.htm",
     "RBC": "https://www1.royalbank.com/sgw3/secureauth/login",
     "Scotiabank": "https://www1.scotiaonline.scotiabank.com/online/authentication/authentication.bns",
 }
+# (session key, display label) for the credit-card question sequence.
+FINANCE_CREDIT_ORDER = [("td_credit", "TD Credit"), ("plat", "Plat"), ("aero", "Aero")]
 _sheets_service = None
 finance_sessions = {}
 
@@ -208,51 +214,226 @@ def bank_keyboard(bank):
     return {"inline_keyboard": [[{"text": f"Open {bank}", "url": url}]]}
 
 
-def append_finance_row(date_str, values, others_detail, pap):
-    """Write one row to the finance tracker Sheet. Leaves the Cash+Bank
-    Subtotal (I) and Net Total (K) columns untouched so the Sheet's own
-    ARRAYFORMULA in those columns keeps computing them."""
+_sheet_id_cache = {}
+
+
+def get_sheet_id(sheet_name):
+    """Look up the numeric sheetId (gid) for a tab by its title."""
+    if sheet_name in _sheet_id_cache:
+        return _sheet_id_cache[sheet_name]
     service = get_sheets_service()
-    col_a = service.spreadsheets().values().get(
+    meta = service.spreadsheets().get(spreadsheetId=FINANCE_SPREADSHEET_ID).execute()
+    for sheet in meta.get("sheets", []):
+        props = sheet.get("properties", {})
+        if props.get("title") == sheet_name:
+            _sheet_id_cache[sheet_name] = props.get("sheetId")
+            return props.get("sheetId")
+    raise ValueError(f"Sheet tab '{sheet_name}' not found")
+
+
+def find_block_start_row(sheet_name):
+    """First row to start a new day's block: one blank spacer row below
+    whatever is already there, or row 1 if the tab is empty."""
+    service = get_sheets_service()
+    resp = service.spreadsheets().values().get(
         spreadsheetId=FINANCE_SPREADSHEET_ID,
-        range=f"{FINANCE_SHEET_NAME}!A:A",
-    ).execute().get("values", [])
-    next_row = max(len(col_a) + 1, 2)
-
-    # Force others_detail to be treated as plain text: with
-    # valueInputOption=USER_ENTERED, a string starting with "+" (or "=")
-    # is parsed by Sheets as a formula (e.g. "+299 george..." -> #ERROR!).
-    # A leading apostrophe forces literal text, matching manual entry.
-    safe_others_detail = (
-        "'" + others_detail if others_detail and others_detail[0] in "+=-" else others_detail
-    )
-
-    row_values = [
-        date_str,
-        values["Safe"],
-        values["Drawer"],
-        safe_others_detail,
-        values["Others"],
-        values["TD"],
-        values["RBC"],
-        values["Scotiabank"],
-    ]
-    body = {
-        "valueInputOption": "USER_ENTERED",
-        "data": [
-            {"range": f"{FINANCE_SHEET_NAME}!A{next_row}:H{next_row}", "values": [row_values]},
-            {"range": f"{FINANCE_SHEET_NAME}!J{next_row}", "values": [[pap]]},
-        ],
-    }
-    service.spreadsheets().values().batchUpdate(
-        spreadsheetId=FINANCE_SPREADSHEET_ID, body=body
+        range=f"{sheet_name}!A:K",
     ).execute()
-    return next_row
+    rows = resp.get("values", [])
+    last_used = 0
+    for i, row in enumerate(rows, start=1):
+        if any(str(v).strip() for v in row):
+            last_used = i
+    return 1 if last_used == 0 else last_used + 2
+
+
+def _rgb(r, g, b):
+    return {"red": r, "green": g, "blue": b}
+
+
+WHITE = _rgb(1, 1, 1)
+PASTEL_ITEM_COLORS = [
+    _rgb(0.80, 0.86, 0.97),  # blue   (Safe)
+    _rgb(0.82, 0.93, 0.82),  # green  (Drawer)
+    _rgb(0.99, 0.94, 0.78),  # yellow
+    _rgb(0.87, 0.82, 0.94),  # purple
+    _rgb(0.99, 0.85, 0.85),  # pink
+    _rgb(0.80, 0.93, 0.93),  # teal
+]
+BANK_COLUMN_COLORS = {
+    "TD": _rgb(0.82, 0.93, 0.82),          # green
+    "RBC": _rgb(0.80, 0.86, 0.97),         # blue
+    "Scotiabank": _rgb(0.98, 0.82, 0.82),  # red/pink
+}
+CREDIT_ROW_COLORS = {
+    "TD Credit": _rgb(0.82, 0.93, 0.82),  # green
+    "Plat": _rgb(0.99, 0.94, 0.78),       # yellow
+    "Aero": _rgb(0.80, 0.86, 0.97),       # blue
+}
+TOTALS_COLOR = _rgb(0.85, 0.85, 0.85)  # light gray
+
+THIN_BLACK_BORDER = {"style": "SOLID", "width": 1, "color": {"red": 0, "green": 0, "blue": 0}}
+THICK_BLACK_BORDER = {"style": "SOLID_THICK", "width": 2, "color": {"red": 0, "green": 0, "blue": 0}}
+
+
+def _cell(value=None, bold=False, bg=None, align="CENTER", font_size=10):
+    fmt = {
+        "textFormat": {"bold": bold, "fontSize": font_size},
+        "horizontalAlignment": align,
+        "verticalAlignment": "MIDDLE",
+    }
+    if bg:
+        fmt["backgroundColor"] = bg
+    cell = {"userEnteredFormat": fmt}
+    if value is not None:
+        if isinstance(value, (int, float)):
+            cell["userEnteredValue"] = {"numberValue": value}
+        else:
+            cell["userEnteredValue"] = {"stringValue": str(value)}
+    return cell
+
+
+def build_finance_block_rows(session):
+    """Build the 11-column (A:K) grid of cells for one day's block, matching
+    the design confirmed live in the Layout Draft tab."""
+    date_label = session["date_display"]
+    v = session["values"]
+    others = session["others_items"]  # list of (amount, name)
+    pap = session["pap"]
+
+    others_sum = sum(a for a, _ in others)
+    subtotal = (
+        v["Safe"] + v["Drawer"] + others_sum + v["TD"] + v["RBC"] + v["Scotiabank"]
+        + v["td_credit"] + v["plat"] + v["aero"]  # already stored negative
+    )
+    net = subtotal - pap
+    session["subtotal"] = subtotal
+    session["net"] = net
+
+    n_rows = max(3, 2 + len(others))
+    grid = [[None] * 11 for _ in range(n_rows)]  # columns A..K -> index 0..10
+
+    color_i = 0
+
+    def next_item_color():
+        nonlocal color_i
+        c = PASTEL_ITEM_COLORS[color_i % len(PASTEL_ITEM_COLORS)]
+        color_i += 1
+        return c
+
+    safe_color = next_item_color()
+    drawer_color = next_item_color()
+
+    # Row 0: date (title), Safe, TD Credit
+    grid[0][0] = _cell(date_label, bold=True, align="LEFT", font_size=14, bg=WHITE)
+    grid[0][1] = _cell("Safe", bold=True, align="RIGHT", bg=safe_color)
+    grid[0][2] = _cell(v["Safe"], bg=safe_color)
+    grid[0][6] = _cell(v["td_credit"], bg=CREDIT_ROW_COLORS["TD Credit"])
+    grid[0][7] = _cell("TD Credit", bold=True, align="LEFT", bg=CREDIT_ROW_COLORS["TD Credit"])
+
+    # Row 1: Drawer, bank values, Plat, totals values
+    grid[1][1] = _cell("Drawer", bold=True, align="RIGHT", bg=drawer_color)
+    grid[1][2] = _cell(v["Drawer"], bg=drawer_color)
+    grid[1][3] = _cell(v["TD"], bg=BANK_COLUMN_COLORS["TD"])
+    grid[1][4] = _cell(v["RBC"], bg=BANK_COLUMN_COLORS["RBC"])
+    grid[1][5] = _cell(v["Scotiabank"], bg=BANK_COLUMN_COLORS["Scotiabank"])
+    grid[1][6] = _cell(v["plat"], bg=CREDIT_ROW_COLORS["Plat"])
+    grid[1][7] = _cell("Plat", bold=True, align="LEFT", bg=CREDIT_ROW_COLORS["Plat"])
+    grid[1][8] = _cell(subtotal, bg=TOTALS_COLOR)
+    grid[1][9] = _cell(pap, bg=TOTALS_COLOR)
+    grid[1][10] = _cell(net, bg=TOTALS_COLOR)
+
+    # Row 2: first "other" (if any), bank labels, Aero, totals labels
+    grid[2][3] = _cell("TD", bold=True, bg=BANK_COLUMN_COLORS["TD"])
+    grid[2][4] = _cell("RBC", bold=True, bg=BANK_COLUMN_COLORS["RBC"])
+    grid[2][5] = _cell("SCO", bold=True, bg=BANK_COLUMN_COLORS["Scotiabank"])
+    grid[2][6] = _cell(v["aero"], bg=CREDIT_ROW_COLORS["Aero"])
+    grid[2][7] = _cell("Aero", bold=True, align="LEFT", bg=CREDIT_ROW_COLORS["Aero"])
+    grid[2][8] = _cell("Subtotal", bold=True, bg=TOTALS_COLOR)
+    grid[2][9] = _cell("PAP", bold=True, bg=TOTALS_COLOR)
+    grid[2][10] = _cell("Net", bold=True, bg=TOTALS_COLOR)
+
+    for i, (amount, name) in enumerate(others):
+        row_idx = 2 + i
+        color = next_item_color()
+        grid[row_idx][1] = _cell(name, bold=True, align="RIGHT", bg=color)
+        grid[row_idx][2] = _cell(amount, bg=color)
+
+    return grid, n_rows
+
+
+def write_finance_block(session):
+    """Write one full day's block to FINANCE_BLOCK_SHEET_NAME, stacked below
+    whatever is already there (with a blank spacer row), fully formatted
+    (colors, bold labels, alignment, grid + thick outer border) in one
+    batchUpdate call. Returns the 1-based row the block starts on."""
+    sheet_name = FINANCE_BLOCK_SHEET_NAME
+    sheet_id = get_sheet_id(sheet_name)
+    start_row = find_block_start_row(sheet_name)  # 1-based
+    grid, n_rows = build_finance_block_rows(session)
+
+    start_row_index = start_row - 1
+    end_row_index = start_row_index + n_rows
+
+    rows_payload = []
+    for r in range(n_rows):
+        row_values = []
+        for c in range(11):
+            cell = grid[r][c]
+            row_values.append(cell if cell is not None else {"userEnteredFormat": {"verticalAlignment": "MIDDLE"}})
+        rows_payload.append({"values": row_values})
+
+    block_range = {
+        "sheetId": sheet_id,
+        "startRowIndex": start_row_index,
+        "endRowIndex": end_row_index,
+        "startColumnIndex": 0,
+        "endColumnIndex": 11,
+    }
+    requests_body = [
+        {
+            "updateCells": {
+                "rows": rows_payload,
+                "fields": "userEnteredValue,userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)",
+                "range": block_range,
+            }
+        },
+        {
+            "updateBorders": {
+                "range": block_range,
+                "top": THIN_BLACK_BORDER, "bottom": THIN_BLACK_BORDER,
+                "left": THIN_BLACK_BORDER, "right": THIN_BLACK_BORDER,
+                "innerHorizontal": THIN_BLACK_BORDER, "innerVertical": THIN_BLACK_BORDER,
+            }
+        },
+        {
+            "updateBorders": {
+                "range": block_range,
+                "top": THICK_BLACK_BORDER, "bottom": THICK_BLACK_BORDER,
+                "left": THICK_BLACK_BORDER, "right": THICK_BLACK_BORDER,
+            }
+        },
+    ]
+
+    service = get_sheets_service()
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=FINANCE_SPREADSHEET_ID, body={"requests": requests_body}
+    ).execute()
+    return start_row
+
+
+def today_label():
+    now = datetime.now()
+    return f"{MONTH_NAMES[now.month - 1]} {now.day}"
 
 
 def start_finance_session(chat_id):
-    finance_sessions[chat_id] = {"step": "date", "values": {}}
-    send_message(chat_id, "New finance entry. Date? (YYYY-MM-DD, or 'today'. /cancel to stop)")
+    finance_sessions[chat_id] = {
+        "step": "safe",
+        "values": {},
+        "date_display": today_label(),
+    }
+    send_message(chat_id, f"New finance entry for {today_label()}. Safe? (amount, or 0 to skip. /cancel to stop)")
 
 
 def handle_finance_session(chat_id, text):
@@ -269,34 +450,18 @@ def handle_finance_session(chat_id, text):
     if step == "confirm":
         if stripped.lower() in ("yes", "y"):
             try:
-                row = append_finance_row(
-                    session["date"], session["values"], session["others_detail"], session["pap"]
-                )
+                row = write_finance_block(session)
             except Exception as e:
                 print("Finance sheet write failed:", e)
                 send_message(chat_id, f"Couldn't save to the Sheet ({e}). Try /log again in a bit.")
                 return
             del finance_sessions[chat_id]
-            send_message(chat_id, f"Saved to row {row} of the Sheet.")
+            send_message(chat_id, f"Saved to the sheet starting at row {row}.")
         elif stripped.lower() in ("no", "n", "cancel"):
             del finance_sessions[chat_id]
             send_message(chat_id, "Discarded, nothing saved.")
         else:
             send_message(chat_id, "Reply yes or no.")
-        return
-
-    if step == "date":
-        low = stripped.lower()
-        if low == "today":
-            date_val = datetime.now().strftime("%Y-%m-%d")
-        elif re.match(r"^\d{4}-\d{2}-\d{2}$", stripped):
-            date_val = stripped
-        else:
-            send_message(chat_id, "Didn't catch that date. Use YYYY-MM-DD or 'today'.")
-            return
-        session["date"] = date_val
-        session["step"] = "safe"
-        send_message(chat_id, "Safe? (amount, or 0 to skip)")
         return
 
     if step == "safe":
@@ -329,6 +494,7 @@ def handle_finance_session(chat_id, text):
             items = []
         else:
             items = parse_others(stripped)
+        session["others_items"] = items
         session["values"]["Others"] = sum(amt for amt, _ in items)
         session["others_detail"] = format_others_detail(items)
         session["step"] = FINANCE_BANK_ORDER[0]
@@ -353,23 +519,52 @@ def handle_finance_session(chat_id, text):
             )
             return
 
+        first_key, first_label = FINANCE_CREDIT_ORDER[0]
+        session["step"] = first_key
+        send_message(chat_id, f"{first_label}? (amount owed, or 0 to skip)")
+        return
+
+    credit_keys = [k for k, _ in FINANCE_CREDIT_ORDER]
+    credit_labels = dict(FINANCE_CREDIT_ORDER)
+
+    if step in credit_keys:
+        amount = parse_finance_amount(stripped)
+        if amount is None:
+            send_message(
+                chat_id,
+                f"Didn't catch a number for {credit_labels[step]}. Enter the amount owed, or 0 to skip.",
+            )
+            return
+        # Stored as negative: these balances reduce the total.
+        session["values"][step] = -abs(amount) if amount else 0.0
+        idx = credit_keys.index(step)
+        if idx + 1 < len(credit_keys):
+            next_key = credit_keys[idx + 1]
+            session["step"] = next_key
+            send_message(chat_id, f"{credit_labels[next_key]}? (amount owed, or 0 to skip)")
+            return
+
         pap, _ = get_total()
+        session["pap"] = pap
+        others_sum = session["values"]["Others"]
         subtotal = (
             session["values"]["Safe"]
             + session["values"]["Drawer"]
-            + session["values"]["Others"]
+            + others_sum
             + sum(session["values"][b] for b in FINANCE_BANK_ORDER)
+            + sum(session["values"][k] for k in credit_keys)
         )
         net = subtotal - pap
-        session["pap"] = pap
         session["step"] = "confirm"
         summary = (
-            f"Date: {session['date']}\n"
+            f"Date: {session['date_display']}\n"
             f"Safe: ${session['values']['Safe']:,.2f}\n"
             f"Drawer: ${session['values']['Drawer']:,.2f}\n"
-            f"Others: {session['others_detail']} (net ${session['values']['Others']:,.2f})\n"
+            f"Others: {session['others_detail']} (net ${others_sum:,.2f})\n"
             + "\n".join(f"{b}: ${session['values'][b]:,.2f}" for b in FINANCE_BANK_ORDER)
-            + f"\n\nCash+Bank subtotal: ${subtotal:,.2f}"
+            + "\n"
+            + "\n".join(f"{credit_labels[k]}: ${session['values'][k]:,.2f}" for k in credit_keys)
+            + f"\n\nSubtotal: ${subtotal:,.2f}"
             + f"\nPAP (dad's money): ${pap:,.2f}"
             + f"\nNet total: ${net:,.2f}"
             + "\n\nSave this to the sheet? yes/no"
