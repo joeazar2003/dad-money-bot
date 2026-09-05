@@ -435,6 +435,25 @@ def write_finance_block(session):
     return start_row, sheet_id, n_rows
 
 
+def read_block_net(start_row):
+    """Read the live, formula-computed Net value for the block starting at
+    start_row (Net sits on the block's second row, column K). Returns None
+    if it can't be read/parsed, so callers can fall back gracefully."""
+    try:
+        service = get_sheets_service()
+        r1 = start_row + 1
+        resp = service.spreadsheets().values().get(
+            spreadsheetId=FINANCE_SPREADSHEET_ID,
+            range=f"{FINANCE_BLOCK_SHEET_NAME}!K{r1}",
+            valueRenderOption="UNFORMATTED_VALUE",
+        ).execute()
+        values = resp.get("values", [])
+        return float(values[0][0])
+    except Exception as e:
+        print("read_block_net failed:", e)
+        return None
+
+
 def sheet_block_url(sheet_id, start_row, n_rows):
     """A link that opens the Sheet (web or the mobile app) with the just-written
     block's range selected/highlighted, so a phone user can actually see it
@@ -579,11 +598,11 @@ def _finish_edit(chat_id, session, label, addr, value_to_write):
         return
     del edit_sessions[chat_id]
     url = sheet_block_url(block["sheet_id"], block["start_row"], block["n_rows"])
-    send_message(
-        chat_id,
-        f"Updated {label} to ${value_to_write:,.2f} (cell {addr}). Subtotal and Net recalculate automatically.",
-        reply_markup=sheet_link_keyboard(url),
-    )
+    msg = f"Updated {label} to ${value_to_write:,.2f} (cell {addr})."
+    net = read_block_net(block["start_row"])
+    if net is not None:
+        msg += f"\nNet total: ${net:,.2f}"
+    send_message(chat_id, msg, reply_markup=sheet_link_keyboard(url))
 
 
 def handle_edit_session(chat_id, text):
@@ -701,11 +720,11 @@ def handle_finance_session(chat_id, text):
                 return
             del finance_sessions[chat_id]
             url = sheet_block_url(sheet_id, row, n_rows)
-            send_message(
-                chat_id,
-                f"Saved to the sheet starting at row {row}.",
-                reply_markup=sheet_link_keyboard(url),
-            )
+            msg = f"Saved to the sheet starting at row {row}."
+            net = read_block_net(row)
+            if net is not None:
+                msg += f"\nNet total: ${net:,.2f}"
+            send_message(chat_id, msg, reply_markup=sheet_link_keyboard(url))
         elif stripped.lower() in ("no", "n", "cancel"):
             del finance_sessions[chat_id]
             send_message(chat_id, "Discarded, nothing saved.")
