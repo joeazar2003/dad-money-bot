@@ -297,24 +297,33 @@ def _cell(value=None, bold=False, bg=None, align="CENTER", font_size=10):
     return cell
 
 
-def build_finance_block_rows(session):
+def _formula_cell(formula, bold=False, bg=None, align="CENTER", font_size=10):
+    fmt = {
+        "textFormat": {"bold": bold, "fontSize": font_size},
+        "horizontalAlignment": align,
+        "verticalAlignment": "MIDDLE",
+    }
+    if bg:
+        fmt["backgroundColor"] = bg
+    return {"userEnteredFormat": fmt, "userEnteredValue": {"formulaValue": formula}}
+
+
+def build_finance_block_rows(session, start_row):
     """Build the 11-column (A:K) grid of cells for one day's block, matching
-    the design confirmed live in the Layout Draft tab."""
+    the design confirmed live in the Layout Draft tab. Subtotal and Net are
+    written as live Sheets formulas (not baked-in numbers) so that editing
+    any source cell directly in the Sheet - Safe, a bank balance, a credit
+    card, an "others" amount - recalculates them automatically."""
     date_label = session["date_display"]
     v = session["values"]
     others = session["others_items"]  # list of (amount, name)
     pap = session["pap"]
 
-    others_sum = sum(a for a, _ in others)
-    subtotal = (
-        v["Safe"] + v["Drawer"] + others_sum + v["TD"] + v["RBC"] + v["Scotiabank"]
-        + v["td_credit"] + v["plat"] + v["aero"]  # already stored negative
-    )
-    net = subtotal - pap
-    session["subtotal"] = subtotal
-    session["net"] = net
-
     n_rows = max(3, 2 + len(others))
+    r0, r1, r2 = start_row, start_row + 1, start_row + 2
+    end_row = start_row + n_rows - 1
+    subtotal_formula = f"=C{r0}+C{r1}+SUM(C{r2}:C{end_row})+D{r1}+E{r1}+F{r1}+G{r0}+G{r1}+G{r2}"
+    net_formula = f"=I{r1}-J{r1}"
     grid = [[None] * 11 for _ in range(n_rows)]  # columns A..K -> index 0..10
 
     color_i = 0
@@ -343,9 +352,9 @@ def build_finance_block_rows(session):
     grid[1][5] = _cell(v["Scotiabank"], bg=BANK_COLUMN_COLORS["Scotiabank"])
     grid[1][6] = _cell(v["plat"], bg=CREDIT_ROW_COLORS["Plat"])
     grid[1][7] = _cell("Plat", bold=True, align="LEFT", bg=CREDIT_ROW_COLORS["Plat"])
-    grid[1][8] = _cell(subtotal, bg=TOTALS_COLOR)
+    grid[1][8] = _formula_cell(subtotal_formula, bg=TOTALS_COLOR)
     grid[1][9] = _cell(pap, bg=TOTALS_COLOR)
-    grid[1][10] = _cell(net, bg=TOTALS_COLOR)
+    grid[1][10] = _formula_cell(net_formula, bg=TOTALS_COLOR)
 
     # Row 2: first "other" (if any), bank labels, Aero, totals labels
     grid[2][3] = _cell("TD", bold=True, bg=BANK_COLUMN_COLORS["TD"])
@@ -374,7 +383,7 @@ def write_finance_block(session):
     sheet_name = FINANCE_BLOCK_SHEET_NAME
     sheet_id = get_sheet_id(sheet_name)
     start_row = find_block_start_row(sheet_name)  # 1-based
-    grid, n_rows = build_finance_block_rows(session)
+    grid, n_rows = build_finance_block_rows(session, start_row)
 
     start_row_index = start_row - 1
     end_row_index = start_row_index + n_rows
@@ -435,6 +444,226 @@ def sheet_block_url(sheet_id, start_row, n_rows):
         f"https://docs.google.com/spreadsheets/d/{FINANCE_SPREADSHEET_ID}"
         f"/edit#gid={sheet_id}&range=A{start_row}:K{end_row}"
     )
+
+
+def write_single_cell(sheet_name, cell_a1, value):
+    """Write one value directly into one cell, e.g. to correct a number after
+    the fact. USER_ENTERED so a plain number lands as a number (and would
+    still work if a formula string were ever passed in)."""
+    service = get_sheets_service()
+    service.spreadsheets().values().update(
+        spreadsheetId=FINANCE_SPREADSHEET_ID,
+        range=f"{sheet_name}!{cell_a1}",
+        valueInputOption="USER_ENTERED",
+        body={"values": [[value]]},
+    ).execute()
+
+
+COL_INDEX = {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4, "F": 5, "G": 6, "H": 7, "I": 8, "J": 9, "K": 10}
+
+# (label, column, which block row it's on, is_credit_card)
+# "is_credit_card" fields are stored as negative numbers, same as during /log.
+EDIT_DIRECT_FIELDS = [
+    ("Safe", "C", "r0", False),
+    ("Drawer", "C", "r1", False),
+    ("TD", "D", "r1", False),
+    ("RBC", "E", "r1", False),
+    ("Scotiabank", "F", "r1", False),
+    ("TD Credit", "G", "r0", True),
+    ("Plat", "G", "r1", True),
+    ("Aero", "G", "r2", True),
+]
+
+
+def edit_field_cell(row_key, col, start_row):
+    row = {"r0": start_row, "r1": start_row + 1, "r2": start_row + 2}[row_key]
+    return f"{col}{row}"
+
+
+def find_last_block(sheet_name):
+    """Locate the most recently written block on the tab: its start row,
+    row count, sheetId, date label, and a live A:K snapshot (read fresh, so
+    any manual edits already made are reflected). Returns None if the tab
+    has no blocks yet."""
+    service = get_sheets_service()
+    sheet_id = get_sheet_id(sheet_name)
+    resp = service.spreadsheets().values().get(
+        spreadsheetId=FINANCE_SPREADSHEET_ID,
+        range=f"{sheet_name}!A:K",
+    ).execute()
+    rows = resp.get("values", [])
+
+    block_starts = [i + 1 for i, row in enumerate(rows) if row and str(row[0]).strip()]
+    if not block_starts:
+        return None
+    start_row = block_starts[-1]
+
+    n_rows = 0
+    for row in rows[start_row - 1:]:
+        if not any(str(v).strip() for v in row):
+            break
+        n_rows += 1
+
+    end_row = start_row + n_rows - 1
+    padded = []
+    for row in rows[start_row - 1:end_row]:
+        padded.append((list(row) + [""] * 11)[:11])
+    while len(padded) < n_rows:
+        padded.append([""] * 11)
+
+    return {
+        "start_row": start_row,
+        "n_rows": n_rows,
+        "sheet_id": sheet_id,
+        "date_label": padded[0][0] or "(unknown date)",
+        "values": padded,
+    }
+
+
+def block_others(block):
+    """[(name, amount, row_index_within_block), ...] for the "others" rows
+    (block row index 2 onward)."""
+    items = []
+    for row_idx in range(2, block["n_rows"]):
+        name = block["values"][row_idx][COL_INDEX["B"]]
+        if str(name).strip():
+            try:
+                amt = float(block["values"][row_idx][COL_INDEX["C"]])
+            except (TypeError, ValueError):
+                amt = 0.0
+            items.append((str(name).strip(), amt, row_idx))
+    return items
+
+
+def field_current_value(block, label, col, row_key):
+    row_idx = {"r0": 0, "r1": 1, "r2": 2}[row_key]
+    raw = block["values"][row_idx][COL_INDEX[col]]
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def edit_fields_prompt(block):
+    lines = [f"Editing the {block['date_label']} entry (row {block['start_row']}). Reply with a number:"]
+    for i, (label, col, row_key, _) in enumerate(EDIT_DIRECT_FIELDS, start=1):
+        current = field_current_value(block, label, col, row_key)
+        lines.append(f"{i}. {label} (${current:,.2f})")
+    others = block_others(block)
+    if others:
+        lines.append(f"{len(EDIT_DIRECT_FIELDS) + 1}. Someone owes/is owed money ({', '.join(n for n, _, _ in others)})")
+    lines.append("\n/cancel to stop.")
+    return "\n".join(lines)
+
+
+edit_sessions = {}
+
+
+def start_edit_session(chat_id):
+    block = find_last_block(FINANCE_BLOCK_SHEET_NAME)
+    if not block:
+        send_message(chat_id, "No entries in the sheet yet to edit.")
+        return
+    edit_sessions[chat_id] = {"step": "pick_field", "block": block}
+    send_message(chat_id, edit_fields_prompt(block))
+
+
+def _finish_edit(chat_id, session, label, addr, value_to_write):
+    block = session["block"]
+    try:
+        write_single_cell(FINANCE_BLOCK_SHEET_NAME, addr, value_to_write)
+    except Exception as e:
+        print("Edit write failed:", e)
+        send_message(chat_id, f"Couldn't write that to the Sheet ({e}). Try /edit again in a bit.")
+        del edit_sessions[chat_id]
+        return
+    del edit_sessions[chat_id]
+    url = sheet_block_url(block["sheet_id"], block["start_row"], block["n_rows"])
+    send_message(
+        chat_id,
+        f"Updated {label} to ${value_to_write:,.2f} (cell {addr}). Subtotal and Net recalculate automatically.",
+        reply_markup=sheet_link_keyboard(url),
+    )
+
+
+def handle_edit_session(chat_id, text):
+    session = edit_sessions[chat_id]
+    stripped = text.strip()
+
+    if stripped.lower() == "/cancel":
+        del edit_sessions[chat_id]
+        send_message(chat_id, "Cancelled, nothing changed.")
+        return
+
+    block = session["block"]
+    step = session["step"]
+
+    if step == "pick_field":
+        others = block_others(block)
+        choice = stripped.lower()
+        n_direct = len(EDIT_DIRECT_FIELDS)
+
+        if choice.isdigit() and 1 <= int(choice) <= n_direct:
+            field = EDIT_DIRECT_FIELDS[int(choice) - 1]
+        else:
+            field = next((f for f in EDIT_DIRECT_FIELDS if choice == f[0].lower()), None)
+
+        if field is not None:
+            label, col, row_key, is_credit = field
+            addr = edit_field_cell(row_key, col, block["start_row"])
+            current = field_current_value(block, label, col, row_key)
+            session["step"] = "new_value"
+            session["target"] = {"label": label, "addr": addr, "is_credit": is_credit}
+            send_message(chat_id, f"New value for {label}? (currently ${current:,.2f}, cell {addr})")
+            return
+
+        if (choice.isdigit() and int(choice) == n_direct + 1 and others) or (
+            others and any(choice == n.lower() for n, _, _ in others)
+        ):
+            if choice.isdigit():
+                pick_lines = ["Which one? Reply with a number:"]
+                for i, (name, amt, _) in enumerate(others, start=1):
+                    pick_lines.append(f"{i}. {name} (${amt:,.2f})")
+                session["step"] = "pick_other"
+                session["others"] = others
+                send_message(chat_id, "\n".join(pick_lines))
+                return
+            name, amt, row_idx = next(o for o in others if o[0].lower() == choice)
+            addr = f"C{block['start_row'] + row_idx}"
+            session["step"] = "new_value"
+            session["target"] = {"label": name, "addr": addr, "is_credit": False}
+            send_message(chat_id, f"New amount for {name}? (currently ${amt:,.2f}, cell {addr})")
+            return
+
+        send_message(chat_id, "Didn't catch that. Reply with one of the numbers above, or /cancel.")
+        return
+
+    if step == "pick_other":
+        others = session["others"]
+        match = None
+        if stripped.isdigit() and 1 <= int(stripped) <= len(others):
+            match = others[int(stripped) - 1]
+        else:
+            match = next((o for o in others if o[0].lower() == stripped.lower()), None)
+        if match is None:
+            send_message(chat_id, "Didn't catch that. Reply with the number or name, or /cancel.")
+            return
+        name, amt, row_idx = match
+        addr = f"C{block['start_row'] + row_idx}"
+        session["step"] = "new_value"
+        session["target"] = {"label": name, "addr": addr, "is_credit": False}
+        send_message(chat_id, f"New amount for {name}? (currently ${amt:,.2f}, cell {addr})")
+        return
+
+    if step == "new_value":
+        amount = parse_finance_amount(stripped)
+        if amount is None:
+            send_message(chat_id, "Didn't catch a number. Try again, or /cancel.")
+            return
+        target = session["target"]
+        value_to_write = -abs(amount) if (target["is_credit"] and amount) else amount
+        _finish_edit(chat_id, session, target["label"], target["addr"], value_to_write)
+        return
 
 
 def today_label():
@@ -629,7 +858,8 @@ HELP_TEXT = (
     "/bysender - breakdown by who sent it\n"
     "/download - get the Excel file\n"
     "/undo - remove the last entry\n"
-    "/log - log today's numbers into the Joe Finance Tracker Sheet\n\n"
+    "/log - log today's numbers into the Joe Finance Tracker Sheet\n"
+    "/edit - fix a number on the most recent entry (Subtotal/Net recalculate automatically)\n\n"
     "Edited the Excel file yourself? Just send it back to me as a file "
     "attachment and I'll use your edited version going forward.\n"
 )
@@ -1027,12 +1257,20 @@ def webhook():
     if not text:
         return "ok"
 
+    if chat_id in edit_sessions:
+        handle_edit_session(chat_id, text)
+        return "ok"
+
     if chat_id in finance_sessions:
         handle_finance_session(chat_id, text)
         return "ok"
 
     if text == "/log":
         start_finance_session(chat_id)
+        return "ok"
+
+    if text == "/edit":
+        start_edit_session(chat_id)
         return "ok"
 
     # Handle a pending duplicate-confirmation from the previous message
