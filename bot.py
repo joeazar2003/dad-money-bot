@@ -214,6 +214,10 @@ def bank_keyboard(bank):
     return {"inline_keyboard": [[{"text": f"Open {bank}", "url": url}]]}
 
 
+def sheet_link_keyboard(url):
+    return {"inline_keyboard": [[{"text": "\U0001F4C4 Open in Sheet", "url": url}]]}
+
+
 _sheet_id_cache = {}
 
 
@@ -419,7 +423,18 @@ def write_finance_block(session):
     service.spreadsheets().batchUpdate(
         spreadsheetId=FINANCE_SPREADSHEET_ID, body={"requests": requests_body}
     ).execute()
-    return start_row
+    return start_row, sheet_id, n_rows
+
+
+def sheet_block_url(sheet_id, start_row, n_rows):
+    """A link that opens the Sheet (web or the mobile app) with the just-written
+    block's range selected/highlighted, so a phone user can actually see it
+    instead of just getting a text confirmation."""
+    end_row = start_row + n_rows - 1
+    return (
+        f"https://docs.google.com/spreadsheets/d/{FINANCE_SPREADSHEET_ID}"
+        f"/edit#gid={sheet_id}&range=A{start_row}:K{end_row}"
+    )
 
 
 def today_label():
@@ -450,13 +465,18 @@ def handle_finance_session(chat_id, text):
     if step == "confirm":
         if stripped.lower() in ("yes", "y"):
             try:
-                row = write_finance_block(session)
+                row, sheet_id, n_rows = write_finance_block(session)
             except Exception as e:
                 print("Finance sheet write failed:", e)
                 send_message(chat_id, f"Couldn't save to the Sheet ({e}). Try /log again in a bit.")
                 return
             del finance_sessions[chat_id]
-            send_message(chat_id, f"Saved to the sheet starting at row {row}.")
+            url = sheet_block_url(sheet_id, row, n_rows)
+            send_message(
+                chat_id,
+                f"Saved to the sheet starting at row {row}.",
+                reply_markup=sheet_link_keyboard(url),
+            )
         elif stripped.lower() in ("no", "n", "cancel"):
             del finance_sessions[chat_id]
             send_message(chat_id, "Discarded, nothing saved.")
