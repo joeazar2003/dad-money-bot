@@ -39,6 +39,21 @@ DRIVE_SHARE_EMAIL = os.environ.get("DRIVE_SHARE_EMAIL", "joeazar2003@gmail.com")
 _drive_service = None
 _drive_file_id = None
 
+# --- Finance tracker Google Sheet ---
+# Separate step-by-step flow (/log) that walks through the notebook's
+# categories and appends a row to the "Joe Finance Tracker" Sheet, pulling
+# the PAP (dad's money) figure straight from get_total() above.
+FINANCE_SPREADSHEET_ID = os.environ.get(
+    "FINANCE_SPREADSHEET_ID", "15RlB-83RQvTVECBmmcXsPYDTirGhIbzmwe3yVkYUHlA"
+)
+FINANCE_SHEET_NAME = os.environ.get("FINANCE_SHEET_NAME", "Sheet1")
+FINANCE_CATEGORY_COLUMNS = [
+    "Safe", "Bassel", "Celine", "OJ", "Chiki", "George", "Gifts",
+    "Other Cash", "RBC", "TD", "Scotiabank", "Amex/Platinum", "Other Bank/Debt",
+]
+_sheets_service = None
+finance_sessions = {}
+
 
 def get_drive_service():
     global _drive_service
@@ -120,6 +135,136 @@ def upload_to_drive():
         print("Drive upload failed:", e)
 
 
+def get_sheets_service():
+    global _sheets_service
+    if _sheets_service is None:
+        creds = service_account.Credentials.from_service_account_file(
+            GOOGLE_CREDS_PATH,
+            scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        )
+        _sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    return _sheets_service
+
+
+def append_finance_row(date_str, values, pap):
+    """Write one row to the finance tracker Sheet. Leaves the Cash+Bank
+    Subtotal (O) and Net Total (Q) columns untouched so the Sheet's own
+    ARRAYFORMULA in those columns keeps computing them."""
+    service = get_sheets_service()
+    col_a = service.spreadsheets().values().get(
+        spreadsheetId=FINANCE_SPREADSHEET_ID,
+        range=f"{FINANCE_SHEET_NAME}!A:A",
+    ).execute().get("values", [])
+    next_row = max(len(col_a) + 1, 2)
+
+    row_values = [date_str] + [values.get(cat, 0) for cat in FINANCE_CATEGORY_COLUMNS]
+    body = {
+        "valueInputOption": "USER_ENTERED",
+        "data": [
+            {"range": f"{FINANCE_SHEET_NAME}!A{next_row}:N{next_row}", "values": [row_values]},
+            {"range": f"{FINANCE_SHEET_NAME}!P{next_row}", "values": [[pap]]},
+        ],
+    }
+    service.spreadsheets().values().batchUpdate(
+        spreadsheetId=FINANCE_SPREADSHEET_ID, body=body
+    ).execute()
+    return next_row
+
+
+def finance_prompt_for_step(step):
+    if step == 0:
+        return "New finance entry. Date? (YYYY-MM-DD, or 'today'. /cancel to stop)"
+    cat = FINANCE_CATEGORY_COLUMNS[step - 1]
+    return f"{cat}? (amount, or 0 to skip)"
+
+
+def start_finance_session(chat_id):
+    finance_sessions[chat_id] = {"step": 0, "values": {}, "date": None}
+    send_message(chat_id, finance_prompt_for_step(0))
+
+
+def handle_finance_session(chat_id, text):
+    session = finance_sessions[chat_id]
+    stripped = text.strip()
+
+    if stripped.lower() == "/cancel":
+        del finance_sessions[chat_id]
+        send_message(chat_id, "Cancelled, nothing saved.")
+        return
+
+    if session["step"] == "confirm":
+        if stripped.lower() in ("yes", "y"):
+            try:
+                row = append_finance_row(session["date"], session["values"], session["pap"])
+            except Exception as e:
+                print("Finance sheet write failed:", e)
+                send_message(chat_id, f"Couldn't save to the Sheet ({e}). Try /log again in a bit.")
+                return
+            del finance_sessions[chat_id]
+            send_message(chat_id, f"Saved to row {row} of the Sheet.")
+        elif stripped.lower() in ("no", "n", "cancel"):
+            del finance_sessions[chat_id]
+            send_message(chat_id, "Discarded, nothing saved.")
+        else:
+            send_message(chat_id, "Reply yes or no.")
+        return
+
+    step = session["step"]
+
+    if step == 0:
+        low = stripped.lower()
+        if low == "today":
+            date_val = datetime.now().strftime("%Y-%m-%d")
+        elif re.match(r"^\d{4}-\d{2}-\d{2}$", stripped):
+            date_val = stripped
+        else:
+            send_message(chat_id, "Didn't catch that date. Use YYYY-MM-DD or 'today'.")
+            return
+        session["date"] = date_val
+        session["step"] = 1
+        send_message(chat_id, finance_prompt_for_step(1))
+        return
+
+    cat = FINANCE_CATEGORY_COLUMNS[step - 1]
+    low = stripped.lower()
+    if low in ("skip", "0", "-", "none", "n/a"):
+        amount = 0.0
+    else:
+        cleaned = stripped.replace(",", "").replace("$", "")
+        try:
+            amount = float(cleaned)
+        except ValueError:
+            send_message(chat_id, f"Didn't catch a number for {cat}. Enter an amount, or 0 to skip.")
+            return
+    session["values"][cat] = amount
+
+    next_step = step + 1
+    if next_step <= len(FINANCE_CATEGORY_COLUMNS):
+        session["step"] = next_step
+        send_message(chat_id, finance_prompt_for_step(next_step))
+        return
+
+    pap, _ = get_total()
+    subtotal = sum(session["values"].values())
+    net = subtotal - pap
+    session["pap"] = pap
+    session["step"] = "confirm"
+    lines = [
+        f"{c}: ${session['values'][c]:,.2f}"
+        for c in FINANCE_CATEGORY_COLUMNS
+        if session["values"][c]
+    ]
+    summary = (
+        f"Date: {session['date']}\n"
+        + ("\n".join(lines) if lines else "(all zero)")
+        + f"\n\nCash+Bank subtotal: ${subtotal:,.2f}"
+        + f"\nPAP (dad's money): ${pap:,.2f}"
+        + f"\nNet total: ${net:,.2f}"
+        + "\n\nSave this to the sheet? yes/no"
+    )
+    send_message(chat_id, summary)
+
+
 # Recognized ways someone might mention a currency, mapped to its code.
 # Longer phrases are checked before shorter ones so "us dollars" matches
 # before a bare "us" would.
@@ -155,7 +300,8 @@ HELP_TEXT = (
     "/thismonth - total for the current month\n"
     "/bysender - breakdown by who sent it\n"
     "/download - get the Excel file\n"
-    "/undo - remove the last entry\n\n"
+    "/undo - remove the last entry\n"
+    "/log - log today's numbers into the Joe Finance Tracker Sheet\n\n"
     "Edited the Excel file yourself? Just send it back to me as a file "
     "attachment and I'll use your edited version going forward.\n"
 )
@@ -548,6 +694,14 @@ def webhook():
 
     text = (message.get("text") or "").strip()
     if not text:
+        return "ok"
+
+    if chat_id in finance_sessions:
+        handle_finance_session(chat_id, text)
+        return "ok"
+
+    if text == "/log":
+        start_finance_session(chat_id)
         return "ok"
 
     # Handle a pending duplicate-confirmation from the previous message
