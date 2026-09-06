@@ -914,7 +914,8 @@ HELP_TEXT = (
     "/download - get the Excel file\n"
     "/undo - remove the last entry\n"
     "/log - log today's numbers into the Joe Finance Tracker Sheet\n"
-    "/edit - fix a number on the most recent entry (Subtotal/Net recalculate automatically)\n\n"
+    "/edit - fix a number on the most recent entry (Subtotal/Net recalculate automatically)\n"
+    "/sheet - jump straight to the Finance Tracker sheet\n\n"
     "Edited the Excel file yourself? Just send it back to me as a file "
     "attachment and I'll use your edited version going forward.\n"
 )
@@ -1392,6 +1393,20 @@ def webhook():
 
     if text == "/edit":
         start_edit_session(chat_id)
+        return "ok"
+
+    if text == "/sheet":
+        block = find_last_block(FINANCE_BLOCK_SHEET_NAME)
+        if block:
+            url = sheet_block_url(block["sheet_id"], block["start_row"], block["n_rows"])
+        else:
+            try:
+                sheet_id = get_sheet_id(FINANCE_BLOCK_SHEET_NAME)
+                url = f"https://docs.google.com/spreadsheets/d/{FINANCE_SPREADSHEET_ID}/edit#gid={sheet_id}"
+            except Exception as e:
+                print("get_sheet_id failed:", e)
+                url = f"https://docs.google.com/spreadsheets/d/{FINANCE_SPREADSHEET_ID}/edit"
+        send_message(chat_id, "Here's your Finance Tracker sheet:", reply_markup=sheet_link_keyboard(url))
         return "ok"
 
     # Handle a pending duplicate-confirmation from the previous message
