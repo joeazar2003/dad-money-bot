@@ -915,7 +915,8 @@ HELP_TEXT = (
     "/undo - remove the last entry\n"
     "/log - log today's numbers into the Joe Finance Tracker Sheet\n"
     "/edit - fix a number on the most recent entry (Subtotal/Net recalculate automatically)\n"
-    "/sheet - jump straight to the Finance Tracker sheet\n\n"
+        "/sheet - jump straight to the Finance Tracker sheet\n"
+        "/dadsheet - jump straight to the dad-money Log sheet\n\n"
     "Edited the Excel file yourself? Just send it back to me as a file "
     "attachment and I'll use your edited version going forward.\n"
 )
@@ -1409,7 +1410,15 @@ def webhook():
         send_message(chat_id, "Here's your Finance Tracker sheet:", reply_markup=sheet_link_keyboard(url))
         return "ok"
 
-    # Handle a pending duplicate-confirmation from the previous message
+        if text == "/dadsheet":
+        url = log_sheet_url()
+        if url:
+            send_message(chat_id, "Here's your dad-money Log sheet:", reply_markup=sheet_link_keyboard(url))
+        else:
+            send_message(chat_id, "Couldn't find the dad-money file in Drive yet — log an entry first.")
+        return "ok"
+
+# Handle a pending duplicate-confirmation from the previous message
     if chat_id in pending_confirmations:
         if text.lower() in ("yes", "y"):
             pending_amount, pending_note = pending_confirmations.pop(chat_id)
