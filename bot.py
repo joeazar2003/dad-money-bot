@@ -1410,7 +1410,7 @@ def webhook():
         send_message(chat_id, "Here's your Finance Tracker sheet:", reply_markup=sheet_link_keyboard(url))
         return "ok"
 
-        if text == "/dadsheet":
+    if text == "/dadsheet":
         url = log_sheet_url()
         if url:
             send_message(chat_id, "Here's your dad-money Log sheet:", reply_markup=sheet_link_keyboard(url))
@@ -1418,7 +1418,7 @@ def webhook():
             send_message(chat_id, "Couldn't find the dad-money file in Drive yet — log an entry first.")
         return "ok"
 
-# Handle a pending duplicate-confirmation from the previous message
+    # Handle a pending duplicate-confirmation from the previous message
     if chat_id in pending_confirmations:
         if text.lower() in ("yes", "y"):
             pending_amount, pending_note = pending_confirmations.pop(chat_id)
