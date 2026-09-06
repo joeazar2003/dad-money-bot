@@ -915,6 +915,7 @@ HELP_TEXT = (
     "/undo - remove the last entry\n"
     "/log - log today's numbers into the Joe Finance Tracker Sheet\n"
     "/edit - fix a number on the most recent entry (Subtotal/Net recalculate automatically)\n"
+        "/updatepap - refresh PAP on the most recent entry to your current dad-money total\n"
         "/sheet - jump straight to the Finance Tracker sheet\n"
         "/dadsheet - jump straight to the dad-money Log sheet\n\n"
     "Edited the Excel file yourself? Just send it back to me as a file "
@@ -1394,6 +1395,28 @@ def webhook():
 
     if text == "/edit":
         start_edit_session(chat_id)
+        return "ok"
+
+    if text == "/updatepap":
+        block = find_last_block(FINANCE_BLOCK_SHEET_NAME)
+        if not block:
+            send_message(chat_id, "No entries in the sheet yet to update.")
+            return "ok"
+        addr = edit_field_cell("r1", "J", block["start_row"])
+        old_pap = field_current_value(block, "PAP", "J", "r1")
+        pap, _ = get_total()
+        try:
+            write_single_cell(FINANCE_BLOCK_SHEET_NAME, addr, pap)
+        except Exception as e:
+            print("PAP update failed:", e)
+            send_message(chat_id, f"Couldn't update PAP ({e}). Try again in a bit.")
+            return "ok"
+        url = sheet_block_url(block["sheet_id"], block["start_row"], block["n_rows"])
+        msg = f"Updated PAP from ${old_pap:,.2f} to ${pap:,.2f} (cell {addr})."
+        net = read_block_net(block["start_row"])
+        if net is not None:
+            msg += f"\nNet total: ${net:,.2f}"
+        send_message(chat_id, msg, reply_markup=sheet_link_keyboard(url))
         return "ok"
 
     if text == "/sheet":
