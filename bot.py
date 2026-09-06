@@ -218,6 +218,42 @@ def sheet_link_keyboard(url):
     return {"inline_keyboard": [[{"text": "\U0001F4C4 Open in Sheet", "url": url}]]}
 
 
+def get_xlsx_sheet_gid(file_id, sheet_name):
+    """Best-effort lookup of a tab's gid inside the Drive-hosted dad_money.xlsx,
+    so replies can deep-link straight to it. dad_money.xlsx is a raw .xlsx blob
+    (written with openpyxl, not a native Google Sheet), and the Sheets API only
+    documents support for native spreadsheets - it happens to work for Office
+    files opened in Sheets' compatibility mode too, but callers must still
+    tolerate None here and fall back to a plain document link."""
+    try:
+        service = get_sheets_service()
+        meta = service.spreadsheets().get(spreadsheetId=file_id).execute()
+        for sheet in meta.get("sheets", []):
+            props = sheet.get("properties", {})
+            if props.get("title") == sheet_name:
+                return props.get("sheetId")
+    except Exception as e:
+        print("xlsx gid lookup failed:", e)
+    return None
+
+
+def log_sheet_url(row=None):
+    """Link to the dad-money Log sheet, deep-linked to a specific row when we
+    can resolve the tab's gid. Falls back to just opening the document (or to
+    None if we can't even find the Drive file) so a lookup failure never blocks
+    sending the confirmation message itself."""
+    file_id = find_drive_file_id()
+    if not file_id:
+        return None
+    base = f"https://docs.google.com/spreadsheets/d/{file_id}/edit"
+    gid = get_xlsx_sheet_gid(file_id, "Log")
+    if gid is None:
+        return base
+    if row is None:
+        return f"{base}#gid={gid}"
+    return f"{base}#gid={gid}&range=A{row}"
+
+
 _sheet_id_cache = {}
 
 
@@ -1215,6 +1251,8 @@ def rebuild_summary(wb):
 
 
 def append_entry(amount, note):
+    """Returns the row number the new entry was written to, so callers can
+    link straight to it."""
     ensure_workbook()
     wb = load_workbook(XLSX_PATH)
     ws = get_log_ws(wb)
@@ -1223,10 +1261,12 @@ def append_entry(amount, note):
     date_display = f"{MONTH_NAMES[now.month - 1]} {now.day}"
     timestamp = now.strftime("%Y-%m-%d %H:%M")
     ws.append([date_display, amount, note, timestamp])
+    row = ws.max_row
     finalize_log_sheet(ws)
     rebuild_summary(wb)
     wb.save(XLSX_PATH)
     upload_to_drive()
+    return row
 
 
 def undo_last():
@@ -1358,9 +1398,11 @@ def webhook():
     if chat_id in pending_confirmations:
         if text.lower() in ("yes", "y"):
             pending_amount, pending_note = pending_confirmations.pop(chat_id)
-            append_entry(pending_amount, pending_note)
+            row = append_entry(pending_amount, pending_note)
             total, count = get_total()
-            send_message(chat_id, f"Logged ${pending_amount:,.2f}. Running total: ${total:,.2f} ({count} entries).")
+            msg = f"Logged ${pending_amount:,.2f}. Running total: ${total:,.2f} ({count} entries)."
+            url = log_sheet_url(row)
+            send_message(chat_id, msg, reply_markup=sheet_link_keyboard(url) if url else None)
             return "ok"
         elif text.lower() in ("no", "n", "cancel"):
             pending_confirmations.pop(chat_id, None)
@@ -1427,9 +1469,11 @@ def webhook():
         send_message(chat_id, f"Heads up — you just logged ${amount:,.2f} in the last few minutes too. Log this one as well? Reply yes or no.")
         return "ok"
 
-    append_entry(amount, note)
+    row = append_entry(amount, note)
     total, count = get_total()
-    send_message(chat_id, f"Logged ${amount:,.2f} CAD. Running total: ${total:,.2f} CAD ({count} entries).")
+    msg = f"Logged ${amount:,.2f} CAD. Running total: ${total:,.2f} CAD ({count} entries)."
+    url = log_sheet_url(row)
+    send_message(chat_id, msg, reply_markup=sheet_link_keyboard(url) if url else None)
     return "ok"
 
 
