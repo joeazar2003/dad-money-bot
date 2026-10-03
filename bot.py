@@ -648,6 +648,50 @@ def handle_pap_update_session(chat_id, text):
     send_message(chat_id, msg, reply_markup=sheet_link_keyboard(url))
 
 
+delete_log_sessions = {}
+
+
+def delete_block_rows(sheet_name, start_row, n_rows):
+    """Delete n_rows rows starting at start_row (1-based) from sheet_name."""
+    sheet_id = get_sheet_id(sheet_name)
+    service = get_sheets_service()
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=FINANCE_SPREADSHEET_ID,
+        body={
+            "requests": [
+                {
+                    "deleteDimension": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "dimension": "ROWS",
+                            "startIndex": start_row - 1,
+                            "endIndex": start_row - 1 + n_rows,
+                        }
+                    }
+                }
+            ]
+        },
+    ).execute()
+
+
+def handle_delete_log_session(chat_id, text):
+    block = delete_log_sessions.pop(chat_id)
+    reply = text.strip().lower()
+    if reply in ("yes", "y"):
+        try:
+            delete_block_rows(FINANCE_BLOCK_SHEET_NAME, block["start_row"], block["n_rows"])
+        except Exception as e:
+            print("Delete block failed:", e)
+            send_message(chat_id, f"Couldn't delete that entry ({e}). Try again in a bit.")
+            return
+        send_message(chat_id, f"Deleted the {block['date_label']} entry.")
+    elif reply in ("no", "n", "cancel"):
+        send_message(chat_id, "Okay, kept it.")
+    else:
+        delete_log_sessions[chat_id] = block
+        send_message(chat_id, "Reply yes or no.")
+
+
 def _finish_edit(chat_id, session, label, addr, value_to_write):
     block = session["block"]
     try:
@@ -950,6 +994,7 @@ HELP_TEXT = (
     "/log - log today's numbers into the Joe Finance Tracker Sheet\n"
     "/edit - fix a number on the most recent entry (Subtotal/Net recalculate automatically)\n"
         "/updatepap - update PAP (amount left) on your most recent entry\n"
+        "/deletelog - delete the most recent Finance Tracker entry\n"
         "/sheet - jump straight to the Finance Tracker sheet\n"
         "/dadsheet - jump straight to the dad-money Log sheet\n\n"
     "Edited the Excel file yourself? Just send it back to me as a file "
@@ -1427,6 +1472,10 @@ def webhook():
         handle_pap_update_session(chat_id, text)
         return "ok"
 
+    if chat_id in delete_log_sessions:
+        handle_delete_log_session(chat_id, text)
+        return "ok"
+
     if text == "/log":
         start_finance_session(chat_id)
         return "ok"
@@ -1442,6 +1491,18 @@ def webhook():
             return "ok"
         pap_update_sessions[chat_id] = block
         send_message(chat_id, "PAP? (amount left from dad's money)")
+        return "ok"
+
+    if text == "/deletelog":
+        block = find_last_block(FINANCE_BLOCK_SHEET_NAME)
+        if not block:
+            send_message(chat_id, "No entries in the sheet yet to delete.")
+            return "ok"
+        delete_log_sessions[chat_id] = block
+        send_message(
+            chat_id,
+            f"Delete the {block['date_label']} entry? This removes it from the sheet completely. yes/no",
+        )
         return "ok"
 
     if text == "/sheet":
