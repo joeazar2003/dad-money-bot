@@ -575,6 +575,88 @@ def find_last_block(sheet_name):
     }
 
 
+_MONTH_FULL = {name.lower(): name for name in MONTH_NAMES}
+_MONTH_ABBR = {name[:3].lower(): name for name in MONTH_NAMES}
+
+
+def _match_month_name(word):
+    word = word.strip().lower().rstrip(".")
+    return _MONTH_FULL.get(word) or _MONTH_ABBR.get(word)
+
+
+def parse_entry_date_label(text):
+    """Parse a user-typed date like 'July 1', 'jul 1', '7/1', or
+    '2026-07-01' into the canonical 'Month Day' label blocks are stored
+    under (e.g. 'July 1'). Returns None if it can't be parsed."""
+    text = text.strip()
+    if not text:
+        return None
+
+    m = re.match(r"^([A-Za-z]+)\.?\s+(\d{1,2})(?:st|nd|rd|th)?$", text)
+    if m:
+        month_name = _match_month_name(m.group(1))
+        day = int(m.group(2))
+        if month_name and 1 <= day <= 31:
+            return f"{month_name} {day}"
+        return None
+
+    m = re.match(r"^(\d{1,2})[/\-](\d{1,2})$", text)
+    if m:
+        month, day = int(m.group(1)), int(m.group(2))
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            return f"{MONTH_NAMES[month - 1]} {day}"
+        return None
+
+    m = re.match(r"^\d{4}-(\d{1,2})-(\d{1,2})$", text)
+    if m:
+        month, day = int(m.group(1)), int(m.group(2))
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            return f"{MONTH_NAMES[month - 1]} {day}"
+        return None
+
+    return None
+
+
+def find_block_by_date(sheet_name, date_label):
+    """Find a dated block (e.g. 'July 1') anywhere on the tab, not just the
+    most recent one. If the date appears more than once, returns the last
+    (most recent) matching block. Returns None if no block matches."""
+    service = get_sheets_service()
+    sheet_id = get_sheet_id(sheet_name)
+    resp = service.spreadsheets().values().get(
+        spreadsheetId=FINANCE_SPREADSHEET_ID,
+        range=f"{sheet_name}!A:K",
+    ).execute()
+    rows = resp.get("values", [])
+
+    block_starts = [i + 1 for i, row in enumerate(rows) if row and str(row[0]).strip()]
+    target = date_label.strip().lower()
+    match = None
+    for start_row in block_starts:
+        label = str(rows[start_row - 1][0]).strip()
+        if label.lower() != target:
+            continue
+        n_rows = 0
+        for row in rows[start_row - 1:]:
+            if not any(str(v).strip() for v in row):
+                break
+            n_rows += 1
+        end_row = start_row + n_rows - 1
+        padded = []
+        for row in rows[start_row - 1:end_row]:
+            padded.append((list(row) + [""] * 11)[:11])
+        while len(padded) < n_rows:
+            padded.append([""] * 11)
+        match = {
+            "start_row": start_row,
+            "n_rows": n_rows,
+            "sheet_id": sheet_id,
+            "date_label": label,
+            "values": padded,
+        }
+    return match
+
+
 def block_others(block):
     """[(name, amount, row_index_within_block), ...] for the "others" rows
     (block row index 2 onward)."""
@@ -994,7 +1076,7 @@ HELP_TEXT = (
     "/log - log today's numbers into the Joe Finance Tracker Sheet\n"
     "/edit - fix a number on the most recent entry (Subtotal/Net recalculate automatically)\n"
         "/updatepap - update PAP (amount left) on your most recent entry\n"
-        "/deletelog - delete the most recent Finance Tracker entry\n"
+        "/deletelog [date] - delete a Finance Tracker entry (most recent if no date given, e.g. /deletelog July 1)\n"
         "/sheet - jump straight to the Finance Tracker sheet\n"
         "/dadsheet - jump straight to the dad-money Log sheet\n\n"
     "Edited the Excel file yourself? Just send it back to me as a file "
@@ -1493,11 +1575,22 @@ def webhook():
         send_message(chat_id, "PAP? (amount left from dad's money)")
         return "ok"
 
-    if text == "/deletelog":
-        block = find_last_block(FINANCE_BLOCK_SHEET_NAME)
-        if not block:
-            send_message(chat_id, "No entries in the sheet yet to delete.")
-            return "ok"
+    if text == "/deletelog" or text.startswith("/deletelog "):
+        arg = text[len("/deletelog"):].strip()
+        if arg:
+            date_label = parse_entry_date_label(arg)
+            if not date_label:
+                send_message(chat_id, f"Couldn't make sense of the date {arg!r}. Try like /deletelog July 1.")
+                return "ok"
+            block = find_block_by_date(FINANCE_BLOCK_SHEET_NAME, date_label)
+            if not block:
+                send_message(chat_id, f"No entry found for {date_label}.")
+                return "ok"
+        else:
+            block = find_last_block(FINANCE_BLOCK_SHEET_NAME)
+            if not block:
+                send_message(chat_id, "No entries in the sheet yet to delete.")
+                return "ok"
         delete_log_sessions[chat_id] = block
         send_message(
             chat_id,
