@@ -29,6 +29,14 @@ XLSX_PATH = "dad_money.xlsx"
 HOME_CURRENCY = os.environ.get("HOME_CURRENCY", "CAD").upper()
 PAP_API_KEY = os.environ.get("PAP_API_KEY")
 
+# --- PAP source: a separate personal spending-tracker Excel file on OneDrive ---
+# PAP ("amount left" from dad's money) now comes from a Total row in that
+# file instead of this bot's own running total, fetched via OneDrive's
+# public (no sign-in) Shares API using a share link the user controls.
+SPENDING_TRACKER_SHARE_URL = os.environ.get("SPENDING_TRACKER_SHARE_URL")
+SPENDING_TRACKER_SHEET_NAME = os.environ.get("SPENDING_TRACKER_SHEET_NAME", "Income - Dad")
+SPENDING_TRACKER_COLUMN = os.environ.get("SPENDING_TRACKER_COLUMN", "amount left")
+
 # --- Google Drive backup ---
 # Render's free plan wipes local disk on every restart/redeploy, so the
 # Excel file is mirrored to Google Drive after every change and restored
@@ -848,8 +856,11 @@ def handle_finance_session(chat_id, text):
             send_message(chat_id, f"{credit_labels[next_key]}? (amount owed, or 0 to skip)")
             return
 
-        pap, _ = get_total()
+        pap, pap_err = get_pap_from_spending_tracker()
+        if pap is None:
+            pap, _ = get_total()
         session["pap"] = pap
+        session["pap_err"] = pap_err
         others_sum = session["values"]["Others"]
         subtotal = (
             session["values"]["Safe"]
@@ -869,10 +880,12 @@ def handle_finance_session(chat_id, text):
             + "\n"
             + "\n".join(f"{credit_labels[k]}: ${session['values'][k]:,.2f}" for k in credit_keys)
             + f"\n\nSubtotal: ${subtotal:,.2f}"
-            + f"\nPAP (dad's money): ${pap:,.2f}"
+            + f"\nPAP (amount left from dad's money): ${pap:,.2f}"
             + f"\nNet total: ${net:,.2f}"
-            + "\n\nSave this to the sheet? yes/no"
         )
+        if pap_err:
+            summary += f"\n\n⚠️ Couldn't reach the spending tracker ({pap_err}), so PAP used your dad-money total instead. Fix this and run /updatepap after."
+        summary += "\n\nSave this to the sheet? yes/no"
         send_message(chat_id, summary)
         return
 
@@ -915,7 +928,7 @@ HELP_TEXT = (
     "/undo - remove the last entry\n"
     "/log - log today's numbers into the Joe Finance Tracker Sheet\n"
     "/edit - fix a number on the most recent entry (Subtotal/Net recalculate automatically)\n"
-        "/updatepap - refresh PAP on the most recent entry to your current dad-money total\n"
+        "/updatepap - refresh PAP on the most recent entry from your spending tracker's amount left\n"
         "/sheet - jump straight to the Finance Tracker sheet\n"
         "/dadsheet - jump straight to the dad-money Log sheet\n\n"
     "Edited the Excel file yourself? Just send it back to me as a file "
@@ -1303,6 +1316,50 @@ def get_total():
     return total, count
 
 
+def _onedrive_share_to_download_url(share_url):
+    """Convert a OneDrive/SharePoint 'anyone with the link' sharing URL into
+    a direct-download URL via the public (no sign-in) Shares API."""
+    import base64
+    b64 = base64.urlsafe_b64encode(share_url.encode()).decode().rstrip("=")
+    return f"https://api.onedrive.com/v1.0/shares/u!{b64}/root/content"
+
+
+def get_pap_from_spending_tracker():
+    """Fetch the current 'amount left' total from Joe's spending tracker.
+    Returns (pap, error) - exactly one of which is None."""
+    if not SPENDING_TRACKER_SHARE_URL:
+        return None, "SPENDING_TRACKER_SHARE_URL is not set"
+    try:
+        download_url = _onedrive_share_to_download_url(SPENDING_TRACKER_SHARE_URL)
+        resp = requests.get(download_url, timeout=20, allow_redirects=True)
+        resp.raise_for_status()
+        wb = load_workbook(io.BytesIO(resp.content), data_only=True)
+    except Exception as e:
+        return None, f"couldn't download/open the spending tracker ({e})"
+
+    if SPENDING_TRACKER_SHEET_NAME not in wb.sheetnames:
+        return None, f"sheet '{SPENDING_TRACKER_SHEET_NAME}' not found in spending tracker"
+    ws = wb[SPENDING_TRACKER_SHEET_NAME]
+
+    headers = [str(c.value).strip().lower() if c.value else "" for c in ws[1]]
+    target = SPENDING_TRACKER_COLUMN.strip().lower()
+    if target not in headers:
+        return None, f"column '{SPENDING_TRACKER_COLUMN}' not found in spending tracker"
+    col_idx = headers.index(target)
+
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if row and row[0] is not None and str(row[0]).strip().lower() == "total":
+            val = row[col_idx]
+            if val is None:
+                return None, "Total row's amount-left cell is empty"
+            try:
+                return float(val), None
+            except (TypeError, ValueError):
+                return None, f"Total row's amount-left cell isn't a number ({val!r})"
+
+    return None, "couldn't find a 'Total' row in the spending tracker"
+
+
 def send_message(chat_id, text, reply_markup=None):
     payload = {"chat_id": chat_id, "text": text}
     if reply_markup:
@@ -1404,7 +1461,10 @@ def webhook():
             return "ok"
         addr = edit_field_cell("r1", "J", block["start_row"])
         old_pap = field_current_value(block, "PAP", "J", "r1")
-        pap, _ = get_total()
+        pap, pap_err = get_pap_from_spending_tracker()
+        if pap is None:
+            send_message(chat_id, f"Couldn't update PAP: {pap_err}. Try again in a bit.")
+            return "ok"
         try:
             write_single_cell(FINANCE_BLOCK_SHEET_NAME, addr, pap)
         except Exception as e:
