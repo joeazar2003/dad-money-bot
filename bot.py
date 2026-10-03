@@ -29,12 +29,6 @@ XLSX_PATH = "dad_money.xlsx"
 HOME_CURRENCY = os.environ.get("HOME_CURRENCY", "CAD").upper()
 PAP_API_KEY = os.environ.get("PAP_API_KEY")
 
-# --- PAP ("amount left" from dad's money) ---
-# Set by hand with /setpap <amount> whenever Joe checks his separate
-# spending tracker, and stored in a small Config sheet inside
-# dad_money.xlsx (which is already backed up to Google Drive).
-PAP_CONFIG_SHEET_NAME = "Config"
-
 # --- Google Drive backup ---
 # Render's free plan wipes local disk on every restart/redeploy, so the
 # Excel file is mirrored to Google Drive after every change and restored
@@ -629,6 +623,31 @@ def start_edit_session(chat_id):
     send_message(chat_id, edit_fields_prompt(block))
 
 
+pap_update_sessions = {}
+
+
+def handle_pap_update_session(chat_id, text):
+    block = pap_update_sessions.pop(chat_id)
+    pap = parse_finance_amount(text.strip())
+    if pap is None:
+        send_message(chat_id, "Didn't catch a number. /updatepap again to retry.")
+        return
+    addr = edit_field_cell("r1", "J", block["start_row"])
+    old_pap = field_current_value(block, "PAP", "J", "r1")
+    try:
+        write_single_cell(FINANCE_BLOCK_SHEET_NAME, addr, pap)
+    except Exception as e:
+        print("PAP update failed:", e)
+        send_message(chat_id, f"Couldn't update PAP ({e}). Try again in a bit.")
+        return
+    url = sheet_block_url(block["sheet_id"], block["start_row"], block["n_rows"])
+    msg = f"Updated PAP from ${old_pap:,.2f} to ${pap:,.2f} (cell {addr})."
+    net = read_block_net(block["start_row"])
+    if net is not None:
+        msg += f"\nNet total: ${net:,.2f}"
+    send_message(chat_id, msg, reply_markup=sheet_link_keyboard(url))
+
+
 def _finish_edit(chat_id, session, label, addr, value_to_write):
     block = session["block"]
     try:
@@ -854,11 +873,17 @@ def handle_finance_session(chat_id, text):
             send_message(chat_id, f"{credit_labels[next_key]}? (amount owed, or 0 to skip)")
             return
 
-        pap, pap_err = get_manual_pap()
-        if pap is None:
-            pap, _ = get_total()
+        session["step"] = "pap"
+        send_message(chat_id, "PAP? (amount left from dad's money)")
+        return
+
+    if step == "pap":
+        amount = parse_finance_amount(stripped)
+        if amount is None:
+            send_message(chat_id, "Didn't catch a number for PAP. Enter the amount left from dad's money.")
+            return
+        pap = amount
         session["pap"] = pap
-        session["pap_err"] = pap_err
         others_sum = session["values"]["Others"]
         subtotal = (
             session["values"]["Safe"]
@@ -880,10 +905,8 @@ def handle_finance_session(chat_id, text):
             + f"\n\nSubtotal: ${subtotal:,.2f}"
             + f"\nPAP (amount left from dad's money): ${pap:,.2f}"
             + f"\nNet total: ${net:,.2f}"
+            + "\n\nSave this to the sheet? yes/no"
         )
-        if pap_err:
-            summary += f"\n\n⚠️ {pap_err}, so PAP used your dad-money total instead. Run /setpap <amount> then /updatepap to fix it."
-        summary += "\n\nSave this to the sheet? yes/no"
         send_message(chat_id, summary)
         return
 
@@ -926,8 +949,7 @@ HELP_TEXT = (
     "/undo - remove the last entry\n"
     "/log - log today's numbers into the Joe Finance Tracker Sheet\n"
     "/edit - fix a number on the most recent entry (Subtotal/Net recalculate automatically)\n"
-        "/setpap <amount> - tell me the \"amount left\" from your spending tracker\n"
-        "/updatepap - apply the last /setpap amount to your most recent entry\n"
+        "/updatepap - update PAP (amount left) on your most recent entry\n"
         "/sheet - jump straight to the Finance Tracker sheet\n"
         "/dadsheet - jump straight to the dad-money Log sheet\n\n"
     "Edited the Excel file yourself? Just send it back to me as a file "
@@ -1315,39 +1337,6 @@ def get_total():
     return total, count
 
 
-def get_manual_pap():
-    """Read the PAP ('amount left') value Joe last typed in with /setpap.
-    Returns (pap, error) - exactly one of which is None."""
-    ensure_workbook()
-    wb = load_workbook(XLSX_PATH)
-    if PAP_CONFIG_SHEET_NAME not in wb.sheetnames:
-        return None, "PAP hasn't been set yet - use /setpap <amount> first"
-    ws = wb[PAP_CONFIG_SHEET_NAME]
-    val = ws["B1"].value
-    if val is None:
-        return None, "PAP hasn't been set yet - use /setpap <amount> first"
-    try:
-        return float(val), None
-    except (TypeError, ValueError):
-        return None, f"stored PAP value isn't a number ({val!r})"
-
-
-def set_manual_pap(value):
-    """Store a PAP ('amount left') value Joe typed in with /setpap."""
-    ensure_workbook()
-    wb = load_workbook(XLSX_PATH)
-    if PAP_CONFIG_SHEET_NAME not in wb.sheetnames:
-        ws = wb.create_sheet(PAP_CONFIG_SHEET_NAME)
-        ws["A1"] = "PAP (amount left)"
-        ws["A2"] = "Last set"
-    else:
-        ws = wb[PAP_CONFIG_SHEET_NAME]
-    ws["B1"] = value
-    ws["B2"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-    wb.save(XLSX_PATH)
-    upload_to_drive()
-
-
 def send_message(chat_id, text, reply_markup=None):
     payload = {"chat_id": chat_id, "text": text}
     if reply_markup:
@@ -1434,6 +1423,10 @@ def webhook():
         handle_finance_session(chat_id, text)
         return "ok"
 
+    if chat_id in pap_update_sessions:
+        handle_pap_update_session(chat_id, text)
+        return "ok"
+
     if text == "/log":
         start_finance_session(chat_id)
         return "ok"
@@ -1442,43 +1435,13 @@ def webhook():
         start_edit_session(chat_id)
         return "ok"
 
-    if text.startswith("/setpap"):
-        arg = text[len("/setpap"):].strip().replace(",", "").replace("$", "")
-        if not arg:
-            send_message(chat_id, "Usage: /setpap 8810  (the \"amount left\" from your spending tracker)")
-            return "ok"
-        try:
-            value = float(arg)
-        except ValueError:
-            send_message(chat_id, f"That doesn't look like a number: {arg!r}")
-            return "ok"
-        set_manual_pap(value)
-        send_message(chat_id, f"PAP set to ${value:,.2f}. Run /updatepap to apply it to your most recent entry.")
-        return "ok"
-
     if text == "/updatepap":
         block = find_last_block(FINANCE_BLOCK_SHEET_NAME)
         if not block:
             send_message(chat_id, "No entries in the sheet yet to update.")
             return "ok"
-        addr = edit_field_cell("r1", "J", block["start_row"])
-        old_pap = field_current_value(block, "PAP", "J", "r1")
-        pap, pap_err = get_manual_pap()
-        if pap is None:
-            send_message(chat_id, f"Couldn't update PAP: {pap_err}.")
-            return "ok"
-        try:
-            write_single_cell(FINANCE_BLOCK_SHEET_NAME, addr, pap)
-        except Exception as e:
-            print("PAP update failed:", e)
-            send_message(chat_id, f"Couldn't update PAP ({e}). Try again in a bit.")
-            return "ok"
-        url = sheet_block_url(block["sheet_id"], block["start_row"], block["n_rows"])
-        msg = f"Updated PAP from ${old_pap:,.2f} to ${pap:,.2f} (cell {addr})."
-        net = read_block_net(block["start_row"])
-        if net is not None:
-            msg += f"\nNet total: ${net:,.2f}"
-        send_message(chat_id, msg, reply_markup=sheet_link_keyboard(url))
+        pap_update_sessions[chat_id] = block
+        send_message(chat_id, "PAP? (amount left from dad's money)")
         return "ok"
 
     if text == "/sheet":
