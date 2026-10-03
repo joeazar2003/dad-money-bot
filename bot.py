@@ -29,13 +29,11 @@ XLSX_PATH = "dad_money.xlsx"
 HOME_CURRENCY = os.environ.get("HOME_CURRENCY", "CAD").upper()
 PAP_API_KEY = os.environ.get("PAP_API_KEY")
 
-# --- PAP source: a separate personal spending-tracker Excel file on OneDrive ---
-# PAP ("amount left" from dad's money) now comes from a Total row in that
-# file instead of this bot's own running total, fetched via OneDrive's
-# public (no sign-in) Shares API using a share link the user controls.
-SPENDING_TRACKER_SHARE_URL = os.environ.get("SPENDING_TRACKER_SHARE_URL")
-SPENDING_TRACKER_SHEET_NAME = os.environ.get("SPENDING_TRACKER_SHEET_NAME", "Income - Dad")
-SPENDING_TRACKER_COLUMN = os.environ.get("SPENDING_TRACKER_COLUMN", "amount left")
+# --- PAP ("amount left" from dad's money) ---
+# Set by hand with /setpap <amount> whenever Joe checks his separate
+# spending tracker, and stored in a small Config sheet inside
+# dad_money.xlsx (which is already backed up to Google Drive).
+PAP_CONFIG_SHEET_NAME = "Config"
 
 # --- Google Drive backup ---
 # Render's free plan wipes local disk on every restart/redeploy, so the
@@ -856,7 +854,7 @@ def handle_finance_session(chat_id, text):
             send_message(chat_id, f"{credit_labels[next_key]}? (amount owed, or 0 to skip)")
             return
 
-        pap, pap_err = get_pap_from_spending_tracker()
+        pap, pap_err = get_manual_pap()
         if pap is None:
             pap, _ = get_total()
         session["pap"] = pap
@@ -884,7 +882,7 @@ def handle_finance_session(chat_id, text):
             + f"\nNet total: ${net:,.2f}"
         )
         if pap_err:
-            summary += f"\n\n⚠️ Couldn't reach the spending tracker ({pap_err}), so PAP used your dad-money total instead. Fix this and run /updatepap after."
+            summary += f"\n\n⚠️ {pap_err}, so PAP used your dad-money total instead. Run /setpap <amount> then /updatepap to fix it."
         summary += "\n\nSave this to the sheet? yes/no"
         send_message(chat_id, summary)
         return
@@ -928,7 +926,8 @@ HELP_TEXT = (
     "/undo - remove the last entry\n"
     "/log - log today's numbers into the Joe Finance Tracker Sheet\n"
     "/edit - fix a number on the most recent entry (Subtotal/Net recalculate automatically)\n"
-        "/updatepap - refresh PAP on the most recent entry from your spending tracker's amount left\n"
+        "/setpap <amount> - tell me the \"amount left\" from your spending tracker\n"
+        "/updatepap - apply the last /setpap amount to your most recent entry\n"
         "/sheet - jump straight to the Finance Tracker sheet\n"
         "/dadsheet - jump straight to the dad-money Log sheet\n\n"
     "Edited the Excel file yourself? Just send it back to me as a file "
@@ -1316,48 +1315,37 @@ def get_total():
     return total, count
 
 
-def _onedrive_share_to_download_url(share_url):
-    """Convert a OneDrive/SharePoint 'anyone with the link' sharing URL into
-    a direct-download URL via the public (no sign-in) Shares API."""
-    import base64
-    b64 = base64.urlsafe_b64encode(share_url.encode()).decode().rstrip("=")
-    return f"https://api.onedrive.com/v1.0/shares/u!{b64}/root/content"
-
-
-def get_pap_from_spending_tracker():
-    """Fetch the current 'amount left' total from Joe's spending tracker.
+def get_manual_pap():
+    """Read the PAP ('amount left') value Joe last typed in with /setpap.
     Returns (pap, error) - exactly one of which is None."""
-    if not SPENDING_TRACKER_SHARE_URL:
-        return None, "SPENDING_TRACKER_SHARE_URL is not set"
+    ensure_workbook()
+    wb = load_workbook(XLSX_PATH)
+    if PAP_CONFIG_SHEET_NAME not in wb.sheetnames:
+        return None, "PAP hasn't been set yet - use /setpap <amount> first"
+    ws = wb[PAP_CONFIG_SHEET_NAME]
+    val = ws["B1"].value
+    if val is None:
+        return None, "PAP hasn't been set yet - use /setpap <amount> first"
     try:
-        download_url = _onedrive_share_to_download_url(SPENDING_TRACKER_SHARE_URL)
-        resp = requests.get(download_url, timeout=20, allow_redirects=True)
-        resp.raise_for_status()
-        wb = load_workbook(io.BytesIO(resp.content), data_only=True)
-    except Exception as e:
-        return None, f"couldn't download/open the spending tracker ({e})"
+        return float(val), None
+    except (TypeError, ValueError):
+        return None, f"stored PAP value isn't a number ({val!r})"
 
-    if SPENDING_TRACKER_SHEET_NAME not in wb.sheetnames:
-        return None, f"sheet '{SPENDING_TRACKER_SHEET_NAME}' not found in spending tracker"
-    ws = wb[SPENDING_TRACKER_SHEET_NAME]
 
-    headers = [str(c.value).strip().lower() if c.value else "" for c in ws[1]]
-    target = SPENDING_TRACKER_COLUMN.strip().lower()
-    if target not in headers:
-        return None, f"column '{SPENDING_TRACKER_COLUMN}' not found in spending tracker"
-    col_idx = headers.index(target)
-
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if row and row[0] is not None and str(row[0]).strip().lower() == "total":
-            val = row[col_idx]
-            if val is None:
-                return None, "Total row's amount-left cell is empty"
-            try:
-                return float(val), None
-            except (TypeError, ValueError):
-                return None, f"Total row's amount-left cell isn't a number ({val!r})"
-
-    return None, "couldn't find a 'Total' row in the spending tracker"
+def set_manual_pap(value):
+    """Store a PAP ('amount left') value Joe typed in with /setpap."""
+    ensure_workbook()
+    wb = load_workbook(XLSX_PATH)
+    if PAP_CONFIG_SHEET_NAME not in wb.sheetnames:
+        ws = wb.create_sheet(PAP_CONFIG_SHEET_NAME)
+        ws["A1"] = "PAP (amount left)"
+        ws["A2"] = "Last set"
+    else:
+        ws = wb[PAP_CONFIG_SHEET_NAME]
+    ws["B1"] = value
+    ws["B2"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    wb.save(XLSX_PATH)
+    upload_to_drive()
 
 
 def send_message(chat_id, text, reply_markup=None):
@@ -1454,6 +1442,20 @@ def webhook():
         start_edit_session(chat_id)
         return "ok"
 
+    if text.startswith("/setpap"):
+        arg = text[len("/setpap"):].strip().replace(",", "").replace("$", "")
+        if not arg:
+            send_message(chat_id, "Usage: /setpap 8810  (the \"amount left\" from your spending tracker)")
+            return "ok"
+        try:
+            value = float(arg)
+        except ValueError:
+            send_message(chat_id, f"That doesn't look like a number: {arg!r}")
+            return "ok"
+        set_manual_pap(value)
+        send_message(chat_id, f"PAP set to ${value:,.2f}. Run /updatepap to apply it to your most recent entry.")
+        return "ok"
+
     if text == "/updatepap":
         block = find_last_block(FINANCE_BLOCK_SHEET_NAME)
         if not block:
@@ -1461,9 +1463,9 @@ def webhook():
             return "ok"
         addr = edit_field_cell("r1", "J", block["start_row"])
         old_pap = field_current_value(block, "PAP", "J", "r1")
-        pap, pap_err = get_pap_from_spending_tracker()
+        pap, pap_err = get_manual_pap()
         if pap is None:
-            send_message(chat_id, f"Couldn't update PAP: {pap_err}. Try again in a bit.")
+            send_message(chat_id, f"Couldn't update PAP: {pap_err}.")
             return "ok"
         try:
             write_single_cell(FINANCE_BLOCK_SHEET_NAME, addr, pap)
