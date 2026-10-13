@@ -587,26 +587,27 @@ def _net_worths_from_blocks():
     return out
 
 
-def ensure_net_worth_sheet():
-    """Make sure the Net Worth tab (headers, formats, line graph) exists.
-    Returns (sheet_id, created)."""
+def ensure_net_worth_sheet(sheet_name=None, chart_title="Net worth over time"):
+    """Make sure a Net Worth tab (headers, formats, line graph) exists: the
+    all-time tab by default, or a per-year tab. Returns (sheet_id, created)."""
+    sheet_name = sheet_name or NET_WORTH_SHEET_NAME
     service = get_sheets_service()
     meta = service.spreadsheets().get(spreadsheetId=FINANCE_SPREADSHEET_ID).execute()
     for sheet in meta.get("sheets", []):
         props = sheet.get("properties", {})
-        if props.get("title") == NET_WORTH_SHEET_NAME:
-            _sheet_id_cache[NET_WORTH_SHEET_NAME] = props["sheetId"]
+        if props.get("title") == sheet_name:
+            _sheet_id_cache[sheet_name] = props["sheetId"]
             return props["sheetId"], False
 
     resp = service.spreadsheets().batchUpdate(
         spreadsheetId=FINANCE_SPREADSHEET_ID,
         body={"requests": [{"addSheet": {"properties": {
-            "title": NET_WORTH_SHEET_NAME,
+            "title": sheet_name,
             "gridProperties": {"rowCount": 1000, "columnCount": 14, "frozenRowCount": 1},
         }}}]},
     ).execute()
     sid = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
-    _sheet_id_cache[NET_WORTH_SHEET_NAME] = sid
+    _sheet_id_cache[sheet_name] = sid
 
     def col_range(c, start_row=0, end_row=1000):
         return {"sheetId": sid, "startRowIndex": start_row, "endRowIndex": end_row,
@@ -636,7 +637,7 @@ def ensure_net_worth_sheet():
             "properties": {"pixelSize": 130}, "fields": "pixelSize"}},
         {"addChart": {"chart": {
             "spec": {
-                "title": "Net worth over time",
+                "title": chart_title,
                 "basicChart": {
                     "chartType": "LINE",
                     "legendPosition": "NO_LEGEND",
@@ -662,6 +663,18 @@ def ensure_net_worth_sheet():
     return sid, True
 
 
+def sync_year_tabs(data, years=None):
+    """One tab (with its own graph) per calendar year, e.g. 'Net Worth 2026',
+    rebuilt from the all-time data. `years` limits which years to refresh."""
+    by_year = {}
+    for serial, val in data.items():
+        by_year.setdefault(_serial_to_date(serial).year, {})[serial] = val
+    for year in (years if years is not None else sorted(by_year)):
+        name = f"{NET_WORTH_SHEET_NAME} {year}"
+        sid, _ = ensure_net_worth_sheet(name, chart_title=f"Net worth {year}")
+        _write_net_worth_rows(name, sid, by_year.get(year, {}))
+
+
 def sync_net_worth_from_blocks():
     """Create the tab if needed, then fill in every dated block already in the
     Finance Tracker (existing rows for other dates are kept). Returns
@@ -670,6 +683,7 @@ def sync_net_worth_from_blocks():
     data = _read_net_worth_rows(NET_WORTH_SHEET_NAME)
     data.update(_net_worths_from_blocks())
     _write_net_worth_rows(NET_WORTH_SHEET_NAME, sid, data)
+    sync_year_tabs(data)
     latest = max(data) if data else None
     return sid, len(data), latest, (data[latest] if latest else None)
 
@@ -689,6 +703,7 @@ def record_net_worth(label, net):
             data = _read_net_worth_rows(NET_WORTH_SHEET_NAME)
         data[_date_to_serial(d)] = float(net)
         _write_net_worth_rows(NET_WORTH_SHEET_NAME, sid, data)
+        sync_year_tabs(data, years=[d.year])
     except Exception as e:
         print("record_net_worth failed:", e)
 
@@ -704,8 +719,10 @@ def remove_net_worth_row(label):
         matches = [s for s in data if (_serial_to_date(s).month, _serial_to_date(s).day) == (d.month, d.day)]
         if not matches:
             return
-        del data[max(matches)]
+        removed = max(matches)
+        del data[removed]
         _write_net_worth_rows(NET_WORTH_SHEET_NAME, sid, data)
+        sync_year_tabs(data, years=[_serial_to_date(removed).year])
     except Exception as e:
         print("remove_net_worth_row failed:", e)
 
