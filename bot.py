@@ -3,7 +3,7 @@ import re
 import io
 import hmac
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta, date as _date
 
 import requests
 from flask import Flask, request, jsonify
@@ -501,6 +501,215 @@ def sheet_block_url(sheet_id, start_row, n_rows):
     )
 
 
+# --- Net Worth tab: one row per logged date (date + Net total) and a line graph ---
+NET_WORTH_SHEET_NAME = os.environ.get("NET_WORTH_SHEET_NAME", "Net Worth")
+_SHEETS_EPOCH = _date(1899, 12, 30)
+
+
+def _date_to_serial(d):
+    return (d - _SHEETS_EPOCH).days
+
+
+def _serial_to_date(serial):
+    return _SHEETS_EPOCH + timedelta(days=int(serial))
+
+
+def label_to_date(label, today=None):
+    """Turn a block label like 'October 1' into a real date. Labels carry no
+    year, so use this year (or last year if that would land in the future)."""
+    m = re.match(r"^([A-Za-z]+)\.?\s+(\d{1,2})$", str(label).strip())
+    if not m:
+        return None
+    month_name = _match_month_name(m.group(1))
+    if not month_name:
+        return None
+    today = today or datetime.now().date()
+    try:
+        d = _date(today.year, MONTH_NAMES.index(month_name) + 1, int(m.group(2)))
+    except ValueError:
+        return None
+    if d > today + timedelta(days=1):
+        d = _date(d.year - 1, d.month, d.day)
+    return d
+
+
+def net_worth_sheet_url(sheet_id):
+    return f"https://docs.google.com/spreadsheets/d/{FINANCE_SPREADSHEET_ID}/edit#gid={sheet_id}"
+
+
+def _read_net_worth_rows(sheet_name):
+    resp = get_sheets_service().spreadsheets().values().get(
+        spreadsheetId=FINANCE_SPREADSHEET_ID,
+        range=f"{sheet_name}!A2:B",
+        valueRenderOption="UNFORMATTED_VALUE",
+    ).execute()
+    out = {}
+    for row in resp.get("values", []):
+        if len(row) >= 2 and isinstance(row[0], (int, float)) and isinstance(row[1], (int, float)):
+            out[int(row[0])] = float(row[1])
+    return out
+
+
+def _write_net_worth_rows(sheet_name, sheet_id, data):
+    """Rewrite the whole table (sorted by date) so rows are always in order."""
+    service = get_sheets_service()
+    rows = [[serial, data[serial]] for serial in sorted(data)]
+    service.spreadsheets().values().clear(
+        spreadsheetId=FINANCE_SPREADSHEET_ID, range=f"{sheet_name}!A2:B", body={}
+    ).execute()
+    if rows:
+        service.spreadsheets().values().update(
+            spreadsheetId=FINANCE_SPREADSHEET_ID,
+            range=f"{sheet_name}!A2",
+            valueInputOption="USER_ENTERED",
+            body={"values": rows},
+        ).execute()
+
+
+def _net_worths_from_blocks():
+    """{serial: net} for every Finance Tracker block already in the sheet."""
+    resp = get_sheets_service().spreadsheets().values().get(
+        spreadsheetId=FINANCE_SPREADSHEET_ID,
+        range=f"{FINANCE_BLOCK_SHEET_NAME}!A:K",
+        valueRenderOption="UNFORMATTED_VALUE",
+    ).execute()
+    rows = resp.get("values", [])
+    out = {}
+    for i, row in enumerate(rows):
+        if not (row and str(row[0]).strip()):
+            continue
+        d = label_to_date(row[0])
+        if d is None or i + 1 >= len(rows):
+            continue
+        net_row = rows[i + 1]
+        if len(net_row) > 10 and isinstance(net_row[10], (int, float)):
+            out[_date_to_serial(d)] = float(net_row[10])
+    return out
+
+
+def ensure_net_worth_sheet():
+    """Make sure the Net Worth tab (headers, formats, line graph) exists.
+    Returns (sheet_id, created)."""
+    service = get_sheets_service()
+    meta = service.spreadsheets().get(spreadsheetId=FINANCE_SPREADSHEET_ID).execute()
+    for sheet in meta.get("sheets", []):
+        props = sheet.get("properties", {})
+        if props.get("title") == NET_WORTH_SHEET_NAME:
+            _sheet_id_cache[NET_WORTH_SHEET_NAME] = props["sheetId"]
+            return props["sheetId"], False
+
+    resp = service.spreadsheets().batchUpdate(
+        spreadsheetId=FINANCE_SPREADSHEET_ID,
+        body={"requests": [{"addSheet": {"properties": {
+            "title": NET_WORTH_SHEET_NAME,
+            "gridProperties": {"rowCount": 1000, "columnCount": 14, "frozenRowCount": 1},
+        }}}]},
+    ).execute()
+    sid = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
+    _sheet_id_cache[NET_WORTH_SHEET_NAME] = sid
+
+    def col_range(c, start_row=0, end_row=1000):
+        return {"sheetId": sid, "startRowIndex": start_row, "endRowIndex": end_row,
+                "startColumnIndex": c, "endColumnIndex": c + 1}
+
+    header_fmt = {"backgroundColor": _rgb(0.80, 0.86, 0.97), "textFormat": {"bold": True},
+                  "horizontalAlignment": "CENTER"}
+    requests_body = [
+        {"updateCells": {
+            "rows": [{"values": [
+                {"userEnteredValue": {"stringValue": "Date"}, "userEnteredFormat": header_fmt},
+                {"userEnteredValue": {"stringValue": "Net worth"}, "userEnteredFormat": header_fmt},
+            ]}],
+            "fields": "userEnteredValue,userEnteredFormat",
+            "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
+                      "startColumnIndex": 0, "endColumnIndex": 2},
+        }},
+        {"repeatCell": {"range": col_range(0, 1),
+                        "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "mmm d, yyyy"},
+                                                       "horizontalAlignment": "CENTER"}},
+                        "fields": "userEnteredFormat(numberFormat,horizontalAlignment)"}},
+        {"repeatCell": {"range": col_range(1, 1),
+                        "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "$#,##0.00"}}},
+                        "fields": "userEnteredFormat.numberFormat"}},
+        {"updateDimensionProperties": {
+            "range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 2},
+            "properties": {"pixelSize": 130}, "fields": "pixelSize"}},
+        {"addChart": {"chart": {
+            "spec": {
+                "title": "Net worth over time",
+                "basicChart": {
+                    "chartType": "LINE",
+                    "legendPosition": "NO_LEGEND",
+                    "headerCount": 1,
+                    "axis": [
+                        {"position": "BOTTOM_AXIS", "title": "Date"},
+                        {"position": "LEFT_AXIS", "title": "Net worth ($)"},
+                    ],
+                    "domains": [{"domain": {"sourceRange": {"sources": [col_range(0)]}}}],
+                    "series": [{"series": {"sourceRange": {"sources": [col_range(1)]}},
+                                "targetAxis": "LEFT_AXIS",
+                                "pointStyle": {"shape": "CIRCLE", "size": 6}}],
+                },
+            },
+            "position": {"overlayPosition": {
+                "anchorCell": {"sheetId": sid, "rowIndex": 1, "columnIndex": 3},
+                "widthPixels": 720, "heightPixels": 400}},
+        }}},
+    ]
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=FINANCE_SPREADSHEET_ID, body={"requests": requests_body}
+    ).execute()
+    return sid, True
+
+
+def sync_net_worth_from_blocks():
+    """Create the tab if needed, then fill in every dated block already in the
+    Finance Tracker (existing rows for other dates are kept). Returns
+    (sheet_id, number_of_rows)."""
+    sid, _ = ensure_net_worth_sheet()
+    data = _read_net_worth_rows(NET_WORTH_SHEET_NAME)
+    data.update(_net_worths_from_blocks())
+    _write_net_worth_rows(NET_WORTH_SHEET_NAME, sid, data)
+    latest = max(data) if data else None
+    return sid, len(data), latest, (data[latest] if latest else None)
+
+
+def record_net_worth(label, net):
+    """Add or update the Net Worth row for the entry dated `label`. Never
+    raises: a failure here must not break logging itself."""
+    try:
+        d = label_to_date(label)
+        if d is None or net is None:
+            return
+        sid, created = ensure_net_worth_sheet()
+        if created:
+            data = _read_net_worth_rows(NET_WORTH_SHEET_NAME)
+            data.update(_net_worths_from_blocks())
+        else:
+            data = _read_net_worth_rows(NET_WORTH_SHEET_NAME)
+        data[_date_to_serial(d)] = float(net)
+        _write_net_worth_rows(NET_WORTH_SHEET_NAME, sid, data)
+    except Exception as e:
+        print("record_net_worth failed:", e)
+
+
+def remove_net_worth_row(label):
+    """Drop the Net Worth row for a deleted entry (matched by month/day)."""
+    try:
+        d = label_to_date(label)
+        if d is None:
+            return
+        sid = get_sheet_id(NET_WORTH_SHEET_NAME)
+        data = _read_net_worth_rows(NET_WORTH_SHEET_NAME)
+        matches = [s for s in data if (_serial_to_date(s).month, _serial_to_date(s).day) == (d.month, d.day)]
+        if not matches:
+            return
+        del data[max(matches)]
+        _write_net_worth_rows(NET_WORTH_SHEET_NAME, sid, data)
+    except Exception as e:
+        print("remove_net_worth_row failed:", e)
+
+
 def write_single_cell(sheet_name, cell_a1, value):
     """Write one value directly into one cell, e.g. to correct a number after
     the fact. USER_ENTERED so a plain number lands as a number (and would
@@ -727,6 +936,7 @@ def handle_pap_update_session(chat_id, text):
     net = read_block_net(block["start_row"])
     if net is not None:
         msg += f"\nNet total: ${net:,.2f}"
+        record_net_worth(block["date_label"], net)
     send_message(chat_id, msg, reply_markup=sheet_link_keyboard(url))
 
 
@@ -766,6 +976,7 @@ def handle_delete_log_session(chat_id, text):
             print("Delete block failed:", e)
             send_message(chat_id, f"Couldn't delete that entry ({e}). Try again in a bit.")
             return
+        remove_net_worth_row(block["date_label"])
         send_message(chat_id, f"Deleted the {block['date_label']} entry.")
     elif reply in ("no", "n", "cancel"):
         send_message(chat_id, "Okay, kept it.")
@@ -789,6 +1000,7 @@ def _finish_edit(chat_id, session, label, addr, value_to_write):
     net = read_block_net(block["start_row"])
     if net is not None:
         msg += f"\nNet total: ${net:,.2f}"
+        record_net_worth(block["date_label"], net)
     send_message(chat_id, msg, reply_markup=sheet_link_keyboard(url))
 
 
@@ -911,6 +1123,7 @@ def handle_finance_session(chat_id, text):
             net = read_block_net(row)
             if net is not None:
                 msg += f"\nNet total: ${net:,.2f}"
+                record_net_worth(session["date_display"], net)
             send_message(chat_id, msg, reply_markup=sheet_link_keyboard(url))
         elif stripped.lower() in ("no", "n", "cancel"):
             del finance_sessions[chat_id]
@@ -1077,6 +1290,7 @@ HELP_TEXT = (
     "/edit - fix a number on the most recent entry (Subtotal/Net recalculate automatically)\n"
         "/updatepap - update PAP (amount left) on your most recent entry\n"
         "/deletelog [date] - delete a Finance Tracker entry (most recent if no date given, e.g. /deletelog July 1)\n"
+        "/networth - open the Net Worth tab (net worth by date + line graph)\n"
         "/sheet - jump straight to the Finance Tracker sheet\n"
         "/dadsheet - jump straight to the dad-money Log sheet\n\n"
     "Edited the Excel file yourself? Just send it back to me as a file "
@@ -1596,6 +1810,20 @@ def webhook():
             chat_id,
             f"Delete the {block['date_label']} entry? This removes it from the sheet completely. yes/no",
         )
+        return "ok"
+
+    if text == "/networth":
+        try:
+            sid, n, latest, latest_net = sync_net_worth_from_blocks()
+        except Exception as e:
+            print("Net worth sync failed:", e)
+            send_message(chat_id, f"Couldn't set up the Net Worth tab ({e}). Try again in a bit.")
+            return "ok"
+        if latest is None:
+            msg = "Net Worth tab is ready, but there are no logged entries yet. Use /log first."
+        else:
+            msg = f"Net worth: ${latest_net:,.2f}"
+        send_message(chat_id, msg, reply_markup=sheet_link_keyboard(net_worth_sheet_url(sid)))
         return "ok"
 
     if text == "/sheet":
