@@ -569,6 +569,26 @@ def _write_net_worth_rows(sheet_name, data):
             valueInputOption="USER_ENTERED",
             body={"values": rows},
         ).execute()
+    try:
+        sid = get_sheet_id(sheet_name)
+
+        def fmt(c, cell):
+            return {"repeatCell": {
+                "range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": 1000,
+                          "startColumnIndex": c, "endColumnIndex": c + 1},
+                "cell": {"userEnteredFormat": cell},
+                "fields": "userEnteredFormat(numberFormat,horizontalAlignment)"}}
+
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=FINANCE_SPREADSHEET_ID,
+            body={"requests": [
+                fmt(0, {"numberFormat": {"type": "DATE", "pattern": "mmm d, yyyy"},
+                        "horizontalAlignment": "CENTER"}),
+                fmt(1, {"numberFormat": {"type": "NUMBER", "pattern": "$#,##0.00"}}),
+            ]},
+        ).execute()
+    except Exception as e:
+        print("net worth data format failed:", e)
 
 
 def _net_worths_from_blocks():
