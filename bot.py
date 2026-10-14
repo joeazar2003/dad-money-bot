@@ -292,6 +292,33 @@ def _rgb(r, g, b):
 
 
 WHITE = _rgb(1, 1, 1)
+
+# One background color per month, used on the date column of each entry so
+# months are easy to tell apart from far away. Same month = same color.
+MONTH_COLORS = [
+    _rgb(0.64, 0.76, 0.96),  # Jan  blue
+    _rgb(0.96, 0.69, 0.83),  # Feb  pink
+    _rgb(0.71, 0.88, 0.69),  # Mar  green
+    _rgb(1.00, 0.90, 0.45),  # Apr  yellow
+    _rgb(0.99, 0.74, 0.46),  # May  orange
+    _rgb(0.78, 0.69, 0.92),  # Jun  purple
+    _rgb(0.55, 0.85, 0.85),  # Jul  teal
+    _rgb(0.95, 0.60, 0.58),  # Aug  red
+    _rgb(0.80, 0.90, 0.45),  # Sep  lime
+    _rgb(0.90, 0.76, 0.60),  # Oct  tan
+    _rgb(0.70, 0.78, 0.60),  # Nov  olive
+    _rgb(0.75, 0.80, 0.95),  # Dec  ice
+]
+
+
+def month_color_for_label(label):
+    """Color for a block label like 'October 1' (white if it can't be read)."""
+    m = re.match(r"^([A-Za-z]+)\.?\s+\d{1,2}$", str(label).strip())
+    if m:
+        name = _match_month_name(m.group(1))
+        if name:
+            return MONTH_COLORS[MONTH_NAMES.index(name)]
+    return WHITE
 PASTEL_ITEM_COLORS = [
     _rgb(0.80, 0.86, 0.97),  # blue   (Safe)
     _rgb(0.82, 0.93, 0.82),  # green  (Drawer)
@@ -374,7 +401,10 @@ def build_finance_block_rows(session, start_row):
     drawer_color = next_item_color()
 
     # Row 0: date (title), Safe, TD Credit
-    grid[0][0] = _cell(date_label, bold=True, align="LEFT", font_size=14, bg=WHITE)
+    month_bg = month_color_for_label(date_label)
+    grid[0][0] = _cell(date_label, bold=True, align="LEFT", font_size=14, bg=month_bg)
+    for r in range(1, n_rows):
+        grid[r][0] = {"userEnteredFormat": {"verticalAlignment": "MIDDLE", "backgroundColor": month_bg}}
     grid[0][1] = _cell("Safe", bold=True, align="RIGHT", bg=safe_color)
     grid[0][2] = _cell(v["Safe"], bg=safe_color)
     grid[0][6] = _cell(v["td_credit"], bg=CREDIT_ROW_COLORS["TD Credit"])
@@ -469,6 +499,39 @@ def write_finance_block(session):
         spreadsheetId=FINANCE_SPREADSHEET_ID, body={"requests": requests_body}
     ).execute()
     return start_row, sheet_id, n_rows
+
+
+def recolor_month_blocks():
+    """Give every entry in the Layout Draft tab its month's color on the
+    date column (A). Safe to run any time; never raises."""
+    try:
+        sheet_name = FINANCE_BLOCK_SHEET_NAME
+        sid = get_sheet_id(sheet_name)
+        service = get_sheets_service()
+        rows = service.spreadsheets().values().get(
+            spreadsheetId=FINANCE_SPREADSHEET_ID, range=f"{sheet_name}!A:K",
+        ).execute().get("values", [])
+        reqs = []
+        i = 0
+        while i < len(rows):
+            row = rows[i]
+            if row and str(row[0]).strip():
+                j = i
+                while j < len(rows) and any(str(v).strip() for v in rows[j]):
+                    j += 1
+                reqs.append({"repeatCell": {
+                    "range": {"sheetId": sid, "startRowIndex": i, "endRowIndex": j,
+                              "startColumnIndex": 0, "endColumnIndex": 1},
+                    "cell": {"userEnteredFormat": {"backgroundColor": month_color_for_label(row[0])}},
+                    "fields": "userEnteredFormat.backgroundColor"}})
+                i = j
+            else:
+                i += 1
+        if reqs:
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=FINANCE_SPREADSHEET_ID, body={"requests": reqs}).execute()
+    except Exception as e:
+        print("recolor_month_blocks failed:", e)
 
 
 def read_block_net(start_row):
@@ -799,6 +862,7 @@ def sync_net_worth_from_blocks():
     data.update(_net_worths_from_blocks())
     _write_net_worth_rows(NET_WORTH_DATA_SHEET_NAME, data)
     sid = render_net_worth_dashboard(data)
+    recolor_month_blocks()
     latest = max(data) if data else None
     return sid, len(data), latest, (data[latest] if latest else None)
 
