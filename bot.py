@@ -1696,9 +1696,42 @@ def add_log_total_row(ws):
         c.fill = TOTAL_FILL
 
 
+def month_hex_for_label(label):
+    """Hex color ('RRGGBB') for a Log date like 'September 5', or None."""
+    m = re.match(r"^([A-Za-z]+)\.?\s+\d{1,2}$", str(label or "").strip())
+    name = _match_month_name(m.group(1)) if m else None
+    if not name:
+        return None
+    c = MONTH_COLORS[MONTH_NAMES.index(name)]
+    return "%02X%02X%02X" % tuple(int(round(c[k] * 255)) for k in ("red", "green", "blue"))
+
+
+def color_log_months(ws):
+    """Fill each entry row (A:C) with its month's color."""
+    for r in range(2, ws.max_row + 1):
+        label = ws.cell(row=r, column=1).value
+        if is_total_row([label]):
+            continue
+        hx = month_hex_for_label(label)
+        if not hx:
+            continue
+        fill = PatternFill(start_color=hx, end_color=hx, fill_type="solid")
+        for col in range(1, 4):
+            ws.cell(row=r, column=col).fill = fill
+
+
+def log_needs_recolor(ws):
+    for r in range(2, ws.max_row + 1):
+        hx = month_hex_for_label(ws.cell(row=r, column=1).value)
+        if hx and str(ws.cell(row=r, column=1).fill.start_color.rgb or "")[-6:].upper() != hx:
+            return True
+    return False
+
+
 def finalize_log_sheet(ws):
     """Recompute the total row and re-apply styling. Call after any edit to Log."""
     strip_total_row(ws)
+    color_log_months(ws)
     if ws.max_row > 1:
         add_log_total_row(ws)
     style_header(ws)
@@ -1753,7 +1786,11 @@ def get_log_ws(wb):
     immediately if anything changed - self-healing on first touch, whether
     that touch is a read or a write."""
     ws = wb["Log"]
-    if prepare_log_ws(ws):
+    changed = prepare_log_ws(ws)
+    if log_needs_recolor(ws):
+        finalize_log_sheet(ws)
+        changed = True
+    if changed:
         wb.save(XLSX_PATH)
         upload_to_drive()
     return ws
