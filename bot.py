@@ -501,9 +501,14 @@ def sheet_block_url(sheet_id, start_row, n_rows):
     )
 
 
-# --- Net Worth tab: one row per logged date (date + Net total) and a line graph ---
+# --- Net Worth: a data tab (one row per date) and a dashboard tab that shows one
+# table + line graph per year, side by side ---
 NET_WORTH_SHEET_NAME = os.environ.get("NET_WORTH_SHEET_NAME", "Net Worth")
+NET_WORTH_DATA_SHEET_NAME = os.environ.get("NET_WORTH_DATA_SHEET_NAME", "Net Worth Data")
 _SHEETS_EPOCH = _date(1899, 12, 30)
+NW_BLOCK_COLS = 4        # columns per year: Date, Net worth, 2 for graph width
+NW_COL_PX = 130
+NW_TABLE_TOP = 18        # 0-based row of each table's header (graph sits above)
 
 
 def _date_to_serial(d):
@@ -550,8 +555,8 @@ def _read_net_worth_rows(sheet_name):
     return out
 
 
-def _write_net_worth_rows(sheet_name, sheet_id, data):
-    """Rewrite the whole table (sorted by date) so rows are always in order."""
+def _write_net_worth_rows(sheet_name, data):
+    """Rewrite the whole data table (sorted by date) so rows are always in order."""
     service = get_sheets_service()
     rows = [[serial, data[serial]] for serial in sorted(data)]
     service.spreadsheets().values().clear(
@@ -587,57 +592,148 @@ def _net_worths_from_blocks():
     return out
 
 
-def ensure_net_worth_sheet(sheet_name=None, chart_title="Net worth over time"):
-    """Make sure a Net Worth tab (headers, formats, line graph) exists: the
-    all-time tab by default, or a per-year tab. Returns (sheet_id, created)."""
-    sheet_name = sheet_name or NET_WORTH_SHEET_NAME
-    service = get_sheets_service()
-    meta = service.spreadsheets().get(spreadsheetId=FINANCE_SPREADSHEET_ID).execute()
-    for sheet in meta.get("sheets", []):
-        props = sheet.get("properties", {})
-        if props.get("title") == sheet_name:
-            _sheet_id_cache[sheet_name] = props["sheetId"]
-            return props["sheetId"], False
+def _sheet_meta():
+    meta = get_sheets_service().spreadsheets().get(
+        spreadsheetId=FINANCE_SPREADSHEET_ID,
+        fields="sheets(properties(sheetId,title),charts(chartId))",
+    ).execute()
+    return meta.get("sheets", [])
 
-    resp = service.spreadsheets().batchUpdate(
+
+def _add_sheet(title):
+    resp = get_sheets_service().spreadsheets().batchUpdate(
         spreadsheetId=FINANCE_SPREADSHEET_ID,
         body={"requests": [{"addSheet": {"properties": {
-            "title": sheet_name,
-            "gridProperties": {"rowCount": 1000, "columnCount": 14, "frozenRowCount": 1},
+            "title": title,
+            "gridProperties": {"rowCount": 1000, "columnCount": 40},
         }}}]},
     ).execute()
     sid = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
-    _sheet_id_cache[sheet_name] = sid
+    _sheet_id_cache[title] = sid
+    return sid
 
-    def col_range(c, start_row=0, end_row=1000):
-        return {"sheetId": sid, "startRowIndex": start_row, "endRowIndex": end_row,
-                "startColumnIndex": c, "endColumnIndex": c + 1}
 
+def ensure_net_worth_data_sheet():
+    """The plain Date | Net worth list that everything is built from. You can
+    type past dates straight into it. Returns (sheet_id, created)."""
+    for sheet in _sheet_meta():
+        props = sheet["properties"]
+        if props.get("title") == NET_WORTH_DATA_SHEET_NAME:
+            return props["sheetId"], False
+    sid = _add_sheet(NET_WORTH_DATA_SHEET_NAME)
     header_fmt = {"backgroundColor": _rgb(0.80, 0.86, 0.97), "textFormat": {"bold": True},
                   "horizontalAlignment": "CENTER"}
-    requests_body = [
-        {"updateCells": {
+
+    def col(c, start_row, fmt, fields):
+        return {"repeatCell": {
+            "range": {"sheetId": sid, "startRowIndex": start_row, "endRowIndex": 1000,
+                      "startColumnIndex": c, "endColumnIndex": c + 1},
+            "cell": {"userEnteredFormat": fmt}, "fields": fields}}
+
+    get_sheets_service().spreadsheets().batchUpdate(
+        spreadsheetId=FINANCE_SPREADSHEET_ID,
+        body={"requests": [
+            {"updateCells": {
+                "rows": [{"values": [
+                    {"userEnteredValue": {"stringValue": "Date"}, "userEnteredFormat": header_fmt},
+                    {"userEnteredValue": {"stringValue": "Net worth"}, "userEnteredFormat": header_fmt},
+                ]}],
+                "fields": "userEnteredValue,userEnteredFormat",
+                "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
+                          "startColumnIndex": 0, "endColumnIndex": 2},
+            }},
+            col(0, 1, {"numberFormat": {"type": "DATE", "pattern": "mmm d, yyyy"},
+                       "horizontalAlignment": "CENTER"},
+                "userEnteredFormat(numberFormat,horizontalAlignment)"),
+            col(1, 1, {"numberFormat": {"type": "NUMBER", "pattern": "$#,##0.00"}},
+                "userEnteredFormat.numberFormat"),
+            {"updateDimensionProperties": {
+                "range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 2},
+                "properties": {"pixelSize": 130}, "fields": "pixelSize"}},
+            {"updateSheetProperties": {
+                "properties": {"sheetId": sid, "gridProperties": {"frozenRowCount": 1}},
+                "fields": "gridProperties.frozenRowCount"}},
+        ]},
+    ).execute()
+    return sid, True
+
+
+def render_net_worth_dashboard(data):
+    """Rebuild the 'Net Worth' tab: one block per year laid out left to right,
+    each with a line graph on top and its Date | Net worth table underneath.
+    Also removes the older per-year tabs ('Net Worth 2026' etc.)."""
+    meta = _sheet_meta()
+    sid = None
+    old_charts = []
+    stale = []
+    for sheet in meta:
+        props = sheet["properties"]
+        title = props.get("title", "")
+        if title == NET_WORTH_SHEET_NAME:
+            sid = props["sheetId"]
+            old_charts = [c["chartId"] for c in sheet.get("charts", [])]
+        elif re.fullmatch(re.escape(NET_WORTH_SHEET_NAME) + r" \d{4}", title):
+            stale.append(props["sheetId"])
+    if sid is None:
+        sid = _add_sheet(NET_WORTH_SHEET_NAME)
+    _sheet_id_cache[NET_WORTH_SHEET_NAME] = sid
+
+    by_year = {}
+    for serial, val in data.items():
+        by_year.setdefault(_serial_to_date(serial).year, []).append((serial, val))
+
+    requests_body = [{"deleteEmbeddedObject": {"objectId": cid}} for cid in old_charts]
+    requests_body.append({"unmergeCells": {"range": {"sheetId": sid}}})
+    requests_body.append({"updateCells": {
+        "range": {"sheetId": sid}, "fields": "userEnteredValue,userEnteredFormat"}})
+
+    title_fmt = {"backgroundColor": _rgb(0.80, 0.86, 0.97), "textFormat": {"bold": True, "fontSize": 14},
+                 "horizontalAlignment": "CENTER"}
+    header_fmt = {"backgroundColor": _rgb(0.92, 0.94, 0.98), "textFormat": {"bold": True},
+                  "horizontalAlignment": "CENTER"}
+    date_fmt = {"numberFormat": {"type": "DATE", "pattern": "mmm d, yyyy"}, "horizontalAlignment": "CENTER"}
+    money_fmt = {"numberFormat": {"type": "NUMBER", "pattern": "$#,##0.00"}}
+
+    for i, year in enumerate(sorted(by_year)):
+        c0 = i * NW_BLOCK_COLS
+        entries = sorted(by_year[year])
+        n = len(entries)
+        requests_body.append({"updateDimensionProperties": {
+            "range": {"sheetId": sid, "dimension": "COLUMNS",
+                      "startIndex": c0, "endIndex": c0 + NW_BLOCK_COLS},
+            "properties": {"pixelSize": NW_COL_PX}, "fields": "pixelSize"}})
+        requests_body.append({"updateCells": {
             "rows": [{"values": [
-                {"userEnteredValue": {"stringValue": "Date"}, "userEnteredFormat": header_fmt},
-                {"userEnteredValue": {"stringValue": "Net worth"}, "userEnteredFormat": header_fmt},
+                {"userEnteredValue": {"stringValue": str(year)}, "userEnteredFormat": title_fmt},
+                {"userEnteredFormat": title_fmt},
             ]}],
             "fields": "userEnteredValue,userEnteredFormat",
             "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
-                      "startColumnIndex": 0, "endColumnIndex": 2},
-        }},
-        {"repeatCell": {"range": col_range(0, 1),
-                        "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "mmm d, yyyy"},
-                                                       "horizontalAlignment": "CENTER"}},
-                        "fields": "userEnteredFormat(numberFormat,horizontalAlignment)"}},
-        {"repeatCell": {"range": col_range(1, 1),
-                        "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "$#,##0.00"}}},
-                        "fields": "userEnteredFormat.numberFormat"}},
-        {"updateDimensionProperties": {
-            "range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 2},
-            "properties": {"pixelSize": 130}, "fields": "pixelSize"}},
-        {"addChart": {"chart": {
+                      "startColumnIndex": c0, "endColumnIndex": c0 + 2},
+        }})
+        rows = [{"values": [
+            {"userEnteredValue": {"stringValue": "Date"}, "userEnteredFormat": header_fmt},
+            {"userEnteredValue": {"stringValue": "Net worth"}, "userEnteredFormat": header_fmt},
+        ]}]
+        for serial, val in entries:
+            rows.append({"values": [
+                {"userEnteredValue": {"numberValue": serial}, "userEnteredFormat": date_fmt},
+                {"userEnteredValue": {"numberValue": val}, "userEnteredFormat": money_fmt},
+            ]})
+        requests_body.append({"updateCells": {
+            "rows": rows, "fields": "userEnteredValue,userEnteredFormat",
+            "range": {"sheetId": sid, "startRowIndex": NW_TABLE_TOP,
+                      "endRowIndex": NW_TABLE_TOP + len(rows),
+                      "startColumnIndex": c0, "endColumnIndex": c0 + 2},
+        }})
+
+        def src(c):
+            return {"sheetId": sid, "startRowIndex": NW_TABLE_TOP, "endRowIndex": NW_TABLE_TOP + n + 1,
+                    "startColumnIndex": c0 + c, "endColumnIndex": c0 + c + 1}
+
+        requests_body.append({"addChart": {"chart": {
             "spec": {
-                "title": chart_title,
+                "title": f"Net worth {year}",
                 "basicChart": {
                     "chartType": "LINE",
                     "legendPosition": "NO_LEGEND",
@@ -646,44 +742,43 @@ def ensure_net_worth_sheet(sheet_name=None, chart_title="Net worth over time"):
                         {"position": "BOTTOM_AXIS", "title": "Date"},
                         {"position": "LEFT_AXIS", "title": "Net worth ($)"},
                     ],
-                    "domains": [{"domain": {"sourceRange": {"sources": [col_range(0)]}}}],
-                    "series": [{"series": {"sourceRange": {"sources": [col_range(1)]}},
+                    "domains": [{"domain": {"sourceRange": {"sources": [src(0)]}}}],
+                    "series": [{"series": {"sourceRange": {"sources": [src(1)]}},
                                 "targetAxis": "LEFT_AXIS",
                                 "pointStyle": {"shape": "CIRCLE", "size": 6}}],
                 },
             },
             "position": {"overlayPosition": {
-                "anchorCell": {"sheetId": sid, "rowIndex": 1, "columnIndex": 3},
-                "widthPixels": 720, "heightPixels": 400}},
-        }}},
-    ]
-    service.spreadsheets().batchUpdate(
+                "anchorCell": {"sheetId": sid, "rowIndex": 1, "columnIndex": c0},
+                "widthPixels": NW_COL_PX * NW_BLOCK_COLS - 10, "heightPixels": 340}},
+        }}})
+
+    for stale_id in stale:
+        requests_body.append({"deleteSheet": {"sheetId": stale_id}})
+    get_sheets_service().spreadsheets().batchUpdate(
         spreadsheetId=FINANCE_SPREADSHEET_ID, body={"requests": requests_body}
     ).execute()
-    return sid, True
+    return sid
 
 
-def sync_year_tabs(data, years=None):
-    """One tab (with its own graph) per calendar year, e.g. 'Net Worth 2026',
-    rebuilt from the all-time data. `years` limits which years to refresh."""
-    by_year = {}
-    for serial, val in data.items():
-        by_year.setdefault(_serial_to_date(serial).year, {})[serial] = val
-    for year in (years if years is not None else sorted(by_year)):
-        name = f"{NET_WORTH_SHEET_NAME} {year}"
-        sid, _ = ensure_net_worth_sheet(name, chart_title=f"Net worth {year}")
-        _write_net_worth_rows(name, sid, by_year.get(year, {}))
+def _load_net_worth_data():
+    """Read the data tab, creating it (seeded from existing entries) if new."""
+    _, created = ensure_net_worth_data_sheet()
+    data = _read_net_worth_rows(NET_WORTH_DATA_SHEET_NAME)
+    if created:
+        data.update(_net_worths_from_blocks())
+    return data
 
 
 def sync_net_worth_from_blocks():
-    """Create the tab if needed, then fill in every dated block already in the
-    Finance Tracker (existing rows for other dates are kept). Returns
-    (sheet_id, number_of_rows)."""
-    sid, _ = ensure_net_worth_sheet()
-    data = _read_net_worth_rows(NET_WORTH_SHEET_NAME)
+    """Pick up every dated block already in the Finance Tracker (rows for
+    other dates, e.g. typed in by hand, are kept), then rebuild the
+    dashboard. Returns (dashboard_sheet_id, rows, latest_serial, latest_net)."""
+    _, created = ensure_net_worth_data_sheet()
+    data = _read_net_worth_rows(NET_WORTH_DATA_SHEET_NAME)
     data.update(_net_worths_from_blocks())
-    _write_net_worth_rows(NET_WORTH_SHEET_NAME, sid, data)
-    sync_year_tabs(data)
+    _write_net_worth_rows(NET_WORTH_DATA_SHEET_NAME, data)
+    sid = render_net_worth_dashboard(data)
     latest = max(data) if data else None
     return sid, len(data), latest, (data[latest] if latest else None)
 
@@ -695,15 +790,10 @@ def record_net_worth(label, net):
         d = label_to_date(label)
         if d is None or net is None:
             return
-        sid, created = ensure_net_worth_sheet()
-        if created:
-            data = _read_net_worth_rows(NET_WORTH_SHEET_NAME)
-            data.update(_net_worths_from_blocks())
-        else:
-            data = _read_net_worth_rows(NET_WORTH_SHEET_NAME)
+        data = _load_net_worth_data()
         data[_date_to_serial(d)] = float(net)
-        _write_net_worth_rows(NET_WORTH_SHEET_NAME, sid, data)
-        sync_year_tabs(data, years=[d.year])
+        _write_net_worth_rows(NET_WORTH_DATA_SHEET_NAME, data)
+        render_net_worth_dashboard(data)
     except Exception as e:
         print("record_net_worth failed:", e)
 
@@ -714,15 +804,13 @@ def remove_net_worth_row(label):
         d = label_to_date(label)
         if d is None:
             return
-        sid = get_sheet_id(NET_WORTH_SHEET_NAME)
-        data = _read_net_worth_rows(NET_WORTH_SHEET_NAME)
+        data = _load_net_worth_data()
         matches = [s for s in data if (_serial_to_date(s).month, _serial_to_date(s).day) == (d.month, d.day)]
         if not matches:
             return
-        removed = max(matches)
-        del data[removed]
-        _write_net_worth_rows(NET_WORTH_SHEET_NAME, sid, data)
-        sync_year_tabs(data, years=[_serial_to_date(removed).year])
+        del data[max(matches)]
+        _write_net_worth_rows(NET_WORTH_DATA_SHEET_NAME, data)
+        render_net_worth_dashboard(data)
     except Exception as e:
         print("remove_net_worth_row failed:", e)
 
